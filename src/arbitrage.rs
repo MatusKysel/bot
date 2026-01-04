@@ -57,6 +57,23 @@ pub struct DepthSample {
     pub edge_bps: f64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct BestCandidate {
+    pub size: f64,
+    pub total_notional: f64,
+    pub bundle_price: f64,
+    pub bundle_price_after_fees: f64,
+    pub edge_bps: f64,
+    pub margin_bps: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct MarketEvaluation {
+    pub opportunities: Vec<ArbOpportunity>,
+    pub best_buy_candidate: Option<BestCandidate>,
+    pub depth_samples: Vec<DepthSample>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ArbOpportunity {
     pub side: ArbSide,
@@ -100,20 +117,31 @@ pub fn evaluate_market(
     market: &Market,
     books: &[OutcomeBook],
     config: &ArbitrageConfig,
-) -> Vec<ArbOpportunity> {
+) -> MarketEvaluation {
     if books.len() < config.min_outcomes || books.len() > config.max_outcomes {
-        return Vec::new();
+        return MarketEvaluation {
+            opportunities: Vec::new(),
+            best_buy_candidate: None,
+            depth_samples: Vec::new(),
+        };
     }
+
+    let buy_eval = evaluate_side_with_diagnostics(market, books, config, ArbSide::Buy);
+    let sell_eval = evaluate_side_with_diagnostics(market, books, config, ArbSide::Sell);
 
     let mut opportunities = Vec::new();
-    if let Some(opportunity) = evaluate_side(market, &books, config, ArbSide::Buy) {
+    if let Some(opportunity) = buy_eval.best_opportunity {
         opportunities.push(opportunity);
     }
-    if let Some(opportunity) = evaluate_side(market, &books, config, ArbSide::Sell) {
+    if let Some(opportunity) = sell_eval.best_opportunity {
         opportunities.push(opportunity);
     }
 
-    opportunities
+    MarketEvaluation {
+        opportunities,
+        best_buy_candidate: buy_eval.best_candidate,
+        depth_samples: buy_eval.depth_samples,
+    }
 }
 
 pub fn evaluate_overheat(
@@ -157,16 +185,34 @@ pub fn evaluate_overheat(
     })
 }
 
-fn evaluate_side(
+struct SideEvaluation {
+    best_opportunity: Option<ArbOpportunity>,
+    best_candidate: Option<BestCandidate>,
+    depth_samples: Vec<DepthSample>,
+}
+
+fn evaluate_side_with_diagnostics(
     market: &Market,
     books: &[OutcomeBook],
     config: &ArbitrageConfig,
     side: ArbSide,
-) -> Option<ArbOpportunity> {
-    let outcomes = prepare_outcomes(books, config, side)?;
-    let max_size = max_bundle_size(&outcomes)?;
+) -> SideEvaluation {
+    let mut result = SideEvaluation {
+        best_opportunity: None,
+        best_candidate: None,
+        depth_samples: Vec::new(),
+    };
+
+    let outcomes = match prepare_outcomes(books, config, side) {
+        Some(outcomes) => outcomes,
+        None => return result,
+    };
+    let max_size = match max_bundle_size(&outcomes) {
+        Some(size) => size,
+        None => return result,
+    };
     if max_size <= 0.0 || max_size < config.min_size {
-        return None;
+        return result;
     }
 
     // Profit is piecewise linear across depth breakpoints; sample those + min_size.
@@ -177,13 +223,14 @@ fn evaluate_side(
         &config.target_notionals,
     );
     if sizes.is_empty() {
-        return None;
+        return result;
     }
 
     let fee_multiplier = config.fee_bps / 10_000.0;
     let buffer_margin = config.buffer_bps / 10_000.0;
     let required_margin = config.min_profit + buffer_margin;
     let mut best: Option<ArbOpportunity> = None;
+    let mut best_candidate: Option<BestCandidate> = None;
     let mut cost_candidates: Vec<CostCandidate> = Vec::new();
 
     for size in sizes {
@@ -227,6 +274,13 @@ fn evaluate_side(
 
         let bundle_price = total_notional / size;
         let bundle_price_after_fees = total_after_fees / size;
+        let margin = profit / size;
+        let edge = match side {
+            ArbSide::Buy => 1.0 - bundle_price_after_fees,
+            ArbSide::Sell => bundle_price_after_fees - 1.0,
+        };
+        let edge_bps = edge * 10_000.0;
+        let margin_bps = margin * 10_000.0;
 
         cost_candidates.push(CostCandidate {
             size,
@@ -234,12 +288,25 @@ fn evaluate_side(
             bundle_price,
             bundle_price_after_fees,
         });
+        let should_replace = match &best_candidate {
+            None => true,
+            Some(candidate) => edge_bps > candidate.edge_bps + 1e-9,
+        };
+        if should_replace {
+            best_candidate = Some(BestCandidate {
+                size,
+                total_notional,
+                bundle_price,
+                bundle_price_after_fees,
+                edge_bps,
+                margin_bps,
+            });
+        }
 
         if profit <= 0.0 {
             continue;
         }
 
-        let margin = profit / size;
         if margin < required_margin {
             continue;
         }
@@ -292,12 +359,14 @@ fn evaluate_side(
         }
     }
 
+    let depth_samples = build_depth_samples(&cost_candidates, &config.target_notionals, side);
     if let Some(mut best) = best {
-        best.depth_samples = build_depth_samples(&cost_candidates, &config.target_notionals, side);
-        Some(best)
-    } else {
-        None
+        best.depth_samples = depth_samples.clone();
+        result.best_opportunity = Some(best);
     }
+    result.best_candidate = best_candidate;
+    result.depth_samples = depth_samples;
+    result
 }
 
 fn prepare_outcomes(

@@ -10,6 +10,7 @@ use rand::Rng;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::time::Duration;
@@ -30,6 +31,7 @@ pub struct WsOrderbookHandle {
     cache: OrderbookCache,
     cmd_tx: mpsc::Sender<WsCommand>,
     subscribed: Arc<Mutex<HashSet<String>>>,
+    stats: Arc<WsStats>,
 }
 
 enum WsCommand {
@@ -37,9 +39,41 @@ enum WsCommand {
     Unsubscribe(Vec<String>),
 }
 
+#[derive(Default)]
+struct WsStats {
+    dropped_updates: AtomicU64,
+    resyncs: AtomicU64,
+    reconnects: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct WsStatsSnapshot {
+    pub dropped_updates: u64,
+    pub resyncs: u64,
+    pub reconnects: u64,
+}
+
+impl WsStats {
+    fn snapshot(&self) -> WsStatsSnapshot {
+        WsStatsSnapshot {
+            dropped_updates: self.dropped_updates.load(Ordering::Relaxed),
+            resyncs: self.resyncs.load(Ordering::Relaxed),
+            reconnects: self.reconnects.load(Ordering::Relaxed),
+        }
+    }
+}
+
 impl WsOrderbookHandle {
     pub fn cache(&self) -> OrderbookCache {
         self.cache.clone()
+    }
+
+    pub fn cache_len(&self) -> usize {
+        self.cache.len()
+    }
+
+    pub fn stats_snapshot(&self) -> WsStatsSnapshot {
+        self.stats.snapshot()
     }
 
     pub async fn subscribe_tokens(&self, tokens: Vec<String>) -> Result<()> {
@@ -98,18 +132,21 @@ pub fn spawn_ws_orderbook(config: &PolymarketConfig) -> Result<WsOrderbookHandle
     let (cmd_tx, cmd_rx) = mpsc::channel(512);
     let cache = Arc::new(DashMap::new());
     let subscribed = Arc::new(Mutex::new(HashSet::new()));
+    let stats = Arc::new(WsStats::default());
 
     let task_config = config.clone();
     let task_cache = cache.clone();
     let task_subscribed = subscribed.clone();
+    let task_stats = stats.clone();
     tokio::spawn(async move {
-        ws_task(task_config, task_cache, task_subscribed, cmd_rx).await;
+        ws_task(task_config, task_cache, task_subscribed, task_stats, cmd_rx).await;
     });
 
     Ok(WsOrderbookHandle {
         cache,
         cmd_tx,
         subscribed,
+        stats,
     })
 }
 
@@ -117,6 +154,7 @@ async fn ws_task(
     config: PolymarketConfig,
     cache: OrderbookCache,
     subscribed: Arc<Mutex<HashSet<String>>>,
+    stats: Arc<WsStats>,
     mut cmd_rx: mpsc::Receiver<WsCommand>,
 ) {
     let mut backoff = Backoff::new(
@@ -129,6 +167,7 @@ async fn ws_task(
         match tokio_tungstenite::connect_async(&config.ws_url).await {
             Ok((ws_stream, _)) => {
                 backoff.reset();
+                stats.reconnects.fetch_add(1, Ordering::Relaxed);
                 info!(event = "ws_connected", ws_url = %config.ws_url);
                 let (mut write, mut read) = ws_stream.split();
 
@@ -140,8 +179,10 @@ async fn ws_task(
                     mpsc::channel::<String>(config.ws_update_queue_capacity.max(1));
                 let update_config = config.clone();
                 let update_cache = cache.clone();
-                let update_handle =
-                    tokio::spawn(async move { process_updates(update_config, update_cache, update_rx).await });
+                let update_stats = stats.clone();
+                let update_handle = tokio::spawn(async move {
+                    process_updates(update_config, update_cache, update_stats, update_rx).await
+                });
 
                 let mut ping_interval = tokio::time::interval(Duration::from_secs(
                     config.ws_ping_interval_secs.max(1),
@@ -175,6 +216,7 @@ async fn ws_task(
                                         Message::Text(text) => {
                                             if update_tx.try_send(text).is_err() {
                                                 dropped_updates += 1;
+                                                stats.dropped_updates.fetch_add(1, Ordering::Relaxed);
                                                 if dropped_updates % 100 == 1 {
                                                     warn!(event = "ws_update_dropped", dropped_updates);
                                                 }
@@ -184,6 +226,7 @@ async fn ws_task(
                                             if let Ok(text) = String::from_utf8(bytes) {
                                                 if update_tx.try_send(text).is_err() {
                                                     dropped_updates += 1;
+                                                    stats.dropped_updates.fetch_add(1, Ordering::Relaxed);
                                                     if dropped_updates % 100 == 1 {
                                                         warn!(event = "ws_update_dropped", dropped_updates);
                                                     }
@@ -319,6 +362,7 @@ fn build_asset_message(
 async fn process_updates(
     config: PolymarketConfig,
     cache: OrderbookCache,
+    stats: Arc<WsStats>,
     mut update_rx: mpsc::Receiver<String>,
 ) {
     let client = match PolymarketClient::new(&config) {
@@ -334,8 +378,16 @@ async fn process_updates(
     ));
 
     while let Some(text) = update_rx.recv().await {
-        if let Err(err) =
-            handle_ws_text(&config, &cache, &client, &inflight, &semaphore, &text).await
+        if let Err(err) = handle_ws_text(
+            &config,
+            &cache,
+            &client,
+            &inflight,
+            &semaphore,
+            &stats,
+            &text,
+        )
+        .await
         {
             debug!(event = "ws_update_parse_error", error = %err);
         }
@@ -348,6 +400,7 @@ async fn handle_ws_text(
     client: &PolymarketClient,
     inflight: &Arc<Mutex<HashSet<String>>>,
     semaphore: &Arc<Semaphore>,
+    stats: &Arc<WsStats>,
     text: &str,
 ) -> Result<()> {
     let value: Value = serde_json::from_str(text).context("parse ws json")?;
@@ -361,6 +414,7 @@ async fn handle_ws_text(
                     client,
                     inflight,
                     semaphore,
+                    stats,
                     item,
                     root_type.as_deref(),
                 )
@@ -376,6 +430,7 @@ async fn handle_ws_text(
                     client,
                     inflight,
                     semaphore,
+                    stats,
                     item,
                     root_type.as_deref(),
                 )
@@ -394,6 +449,7 @@ async fn handle_ws_text(
                     client,
                     inflight,
                     semaphore,
+                    stats,
                     item,
                     root_type.as_deref(),
                 )
@@ -407,6 +463,7 @@ async fn handle_ws_text(
                 client,
                 inflight,
                 semaphore,
+                stats,
                 &value,
                 root_type.as_deref(),
             )
@@ -422,6 +479,7 @@ async fn handle_ws_value(
     client: &PolymarketClient,
     inflight: &Arc<Mutex<HashSet<String>>>,
     semaphore: &Arc<Semaphore>,
+    stats: &Arc<WsStats>,
     value: &Value,
     root_type: Option<&str>,
 ) {
@@ -484,6 +542,7 @@ async fn handle_ws_value(
             client.clone(),
             inflight.clone(),
             semaphore.clone(),
+            stats.clone(),
             event.token_id,
             reason,
         )
@@ -496,6 +555,7 @@ async fn schedule_resync(
     client: PolymarketClient,
     inflight: Arc<Mutex<HashSet<String>>>,
     semaphore: Arc<Semaphore>,
+    stats: Arc<WsStats>,
     token_id: String,
     reason: &'static str,
 ) {
@@ -505,6 +565,7 @@ async fn schedule_resync(
             return;
         }
     }
+    stats.resyncs.fetch_add(1, Ordering::Relaxed);
     info!(event = "ws_resync_start", token_id = %token_id, reason);
 
     let permit = match semaphore.acquire_owned().await {

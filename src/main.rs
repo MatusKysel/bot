@@ -38,9 +38,54 @@ struct RunContext {
 }
 
 struct MarketScanResult {
+    market_id: String,
+    market_question: String,
+    market_slug: Option<String>,
     opportunities: Vec<arbitrage::ArbOpportunity>,
     overheat: Option<OverheatSignal>,
     book_age_ms: Option<u64>,
+    skip_reason: Option<SkipReason>,
+    best_candidate: Option<arbitrage::BestCandidate>,
+    depth_samples: Vec<arbitrage::DepthSample>,
+    selected_outcomes: Option<SelectedOutcomes>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum SkipReason {
+    NotBinary,
+    MissingToken,
+    MissingBook,
+    StaleBook,
+    NoDepth,
+    NoEdge,
+    BelowBuffer,
+    BelowMinNotional,
+    AboveMaxNotional,
+    NoOpportunity,
+}
+
+impl SkipReason {
+    fn as_str(&self) -> &'static str {
+        match self {
+            SkipReason::NotBinary => "not_binary",
+            SkipReason::MissingToken => "missing_token",
+            SkipReason::MissingBook => "missing_book",
+            SkipReason::StaleBook => "stale_book",
+            SkipReason::NoDepth => "no_depth",
+            SkipReason::NoEdge => "no_edge",
+            SkipReason::BelowBuffer => "below_buffer",
+            SkipReason::BelowMinNotional => "below_min_notional",
+            SkipReason::AboveMaxNotional => "above_max_notional",
+            SkipReason::NoOpportunity => "no_opportunity",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SelectedOutcomes {
+    yes: polymarket::Outcome,
+    no: polymarket::Outcome,
+    fallback: bool,
 }
 
 struct OverheatState {
@@ -240,6 +285,7 @@ async fn run_scan(
     );
 
     let max_concurrency = config.polymarket.max_concurrent_orderbook_requests.max(1);
+    let selected_count = selected.len();
     let results = if let Some(ws) = ws_handle {
         let token_ids = collect_token_ids(&selected, &config.arbitrage, scan_id);
         if !token_ids.is_empty() {
@@ -281,9 +327,26 @@ async fn run_scan(
     let now = Instant::now();
     let flip_window = Duration::from_secs(OVERHEAT_FLIP_WINDOW_SECS);
     let mut opportunities = 0usize;
+    let mut books_present = 0usize;
+    let mut max_book_age_ms = 0u64;
+    let mut skip_counts: HashMap<String, usize> = HashMap::new();
     for result in results {
         match result {
             Ok(found) => {
+                if let Some(age_ms) = found.book_age_ms {
+                    books_present += 1;
+                    if age_ms > max_book_age_ms {
+                        max_book_age_ms = age_ms;
+                    }
+                }
+                if let Some(reason) = found.skip_reason {
+                    *skip_counts
+                        .entry(reason.as_str().to_string())
+                        .or_insert(0) += 1;
+                    if config.logging.log_opportunity_skipped {
+                        log_opportunity_skipped(&found, scan_id, run_context, config);
+                    }
+                }
                 for opportunity in found.opportunities {
                     let opp_id = OPP_COUNTER.fetch_add(1, Ordering::Relaxed);
                     let span = tracing::info_span!(
@@ -319,6 +382,31 @@ async fn run_scan(
         }
     }
 
+    if config.logging.log_health
+        && scan_id % config.logging.health_log_every_scans.max(1) == 0
+    {
+        let skip_counts_json = serde_json::to_string(&skip_counts).unwrap_or_default();
+        let (cache_size, ws_stats) = if let Some(ws) = ws_handle {
+            (ws.cache_len(), Some(ws.stats_snapshot()))
+        } else {
+            (0, None)
+        };
+        info!(
+            event = "health",
+            scan_id,
+            config_hash = %run_context.config_hash,
+            markets_selected = selected_count,
+            books_present,
+            max_book_age_ms,
+            cache_size,
+            skipped = %skip_counts_json,
+            ws_dropped_updates = ws_stats.as_ref().map(|s| s.dropped_updates).unwrap_or(0),
+            ws_resyncs = ws_stats.as_ref().map(|s| s.resyncs).unwrap_or(0),
+            ws_reconnects = ws_stats.as_ref().map(|s| s.reconnects).unwrap_or(0),
+            monotonic_ms = run_context.start.elapsed().as_millis() as u64
+        );
+    }
+
     info!(
         event = "scan_complete",
         scan_id,
@@ -335,17 +423,24 @@ async fn process_market_from_cache(
     market: polymarket::Market,
     max_quote_age: Duration,
 ) -> Result<MarketScanResult> {
-    let (yes, no, _) = match select_binary_outcomes(&market, config) {
+    let selected = match select_binary_outcomes(&market, config) {
         Some(outcomes) => outcomes,
         None => {
             return Ok(MarketScanResult {
+                market_id: market.id.clone(),
+                market_question: market.question.clone(),
+                market_slug: market.slug.clone(),
                 opportunities: Vec::new(),
                 overheat: None,
                 book_age_ms: None,
+                skip_reason: Some(SkipReason::NotBinary),
+                best_candidate: None,
+                depth_samples: Vec::new(),
+                selected_outcomes: None,
             })
         }
     };
-    let outcomes = vec![yes, no];
+    let outcomes = vec![selected.yes.clone(), selected.no.clone()];
 
     let enforce_staleness = config.require_orderbook && max_quote_age.as_secs() > 0;
     let mut books = Vec::with_capacity(outcomes.len());
@@ -354,9 +449,16 @@ async fn process_market_from_cache(
         if outcome.token_id.trim().is_empty() {
             debug!("missing token id for market {}", market.id);
             return Ok(MarketScanResult {
+                market_id: market.id.clone(),
+                market_question: market.question.clone(),
+                market_slug: market.slug.clone(),
                 opportunities: Vec::new(),
                 overheat: None,
                 book_age_ms: None,
+                skip_reason: Some(SkipReason::MissingToken),
+                best_candidate: None,
+                depth_samples: Vec::new(),
+                selected_outcomes: Some(selected.clone()),
             });
         }
 
@@ -364,9 +466,16 @@ async fn process_market_from_cache(
             if enforce_staleness && state.updated_at.elapsed() > max_quote_age {
                 debug!("stale quote for token {}", outcome.token_id);
                 return Ok(MarketScanResult {
+                    market_id: market.id.clone(),
+                    market_question: market.question.clone(),
+                    market_slug: market.slug.clone(),
                     opportunities: Vec::new(),
                     overheat: None,
                     book_age_ms: None,
+                    skip_reason: Some(SkipReason::StaleBook),
+                    best_candidate: None,
+                    depth_samples: Vec::new(),
+                    selected_outcomes: Some(selected.clone()),
                 });
             }
             let age_ms = state.updated_at.elapsed().as_millis() as u64;
@@ -382,16 +491,36 @@ async fn process_market_from_cache(
 
         debug!("missing cached book for token {}", outcome.token_id);
         return Ok(MarketScanResult {
+            market_id: market.id.clone(),
+            market_question: market.question.clone(),
+            market_slug: market.slug.clone(),
             opportunities: Vec::new(),
             overheat: None,
             book_age_ms: None,
+            skip_reason: Some(SkipReason::MissingBook),
+            best_candidate: None,
+            depth_samples: Vec::new(),
+            selected_outcomes: Some(selected.clone()),
         });
     }
 
+    let evaluation = evaluate_market(&market, &books, config);
+    let skip_reason = if evaluation.opportunities.is_empty() {
+        determine_skip_reason(config, evaluation.best_buy_candidate.as_ref())
+    } else {
+        None
+    };
     Ok(MarketScanResult {
-        opportunities: evaluate_market(&market, &books, config),
+        market_id: market.id.clone(),
+        market_question: market.question.clone(),
+        market_slug: market.slug.clone(),
+        opportunities: evaluation.opportunities,
         overheat: evaluate_overheat(&market, &books, config),
         book_age_ms: max_age_ms,
+        skip_reason,
+        best_candidate: evaluation.best_buy_candidate,
+        depth_samples: evaluation.depth_samples,
+        selected_outcomes: Some(selected),
     })
 }
 
@@ -403,22 +532,22 @@ fn collect_token_ids(
     let mut seen = HashSet::new();
     let mut tokens = Vec::new();
     for market in markets {
-        let (yes, no, fallback) = match select_binary_outcomes(market, config) {
+        let selected = match select_binary_outcomes(market, config) {
             Some(outcomes) => outcomes,
             None => continue,
         };
-        if fallback {
+        if selected.fallback {
             warn!(
                 event = "binary_mapping_fallback",
                 scan_id,
                 market_id = %market.id,
-                yes_name = %yes.name,
-                no_name = %no.name,
-                yes_token_id = %yes.token_id,
-                no_token_id = %no.token_id
+                yes_name = %selected.yes.name,
+                no_name = %selected.no.name,
+                yes_token_id = %selected.yes.token_id,
+                no_token_id = %selected.no.token_id
             );
         }
-        for outcome in [yes, no] {
+        for outcome in [selected.yes, selected.no] {
             if outcome.token_id.trim().is_empty() {
                 continue;
             }
@@ -435,25 +564,39 @@ async fn process_market(
     config: &config::ArbitrageConfig,
     market: polymarket::Market,
 ) -> Result<MarketScanResult> {
-    let (yes, no, _) = match select_binary_outcomes(&market, config) {
+    let selected = match select_binary_outcomes(&market, config) {
         Some(outcomes) => outcomes,
         None => {
             return Ok(MarketScanResult {
+                market_id: market.id.clone(),
+                market_question: market.question.clone(),
+                market_slug: market.slug.clone(),
                 opportunities: Vec::new(),
                 overheat: None,
                 book_age_ms: None,
+                skip_reason: Some(SkipReason::NotBinary),
+                best_candidate: None,
+                depth_samples: Vec::new(),
+                selected_outcomes: None,
             })
         }
     };
 
     let mut books = Vec::with_capacity(2);
-    for outcome in [yes, no] {
+    for outcome in [selected.yes.clone(), selected.no.clone()] {
         if outcome.token_id.trim().is_empty() {
             debug!("missing token id for market {}", market.id);
             return Ok(MarketScanResult {
+                market_id: market.id.clone(),
+                market_question: market.question.clone(),
+                market_slug: market.slug.clone(),
                 opportunities: Vec::new(),
                 overheat: None,
                 book_age_ms: None,
+                skip_reason: Some(SkipReason::MissingToken),
+                best_candidate: None,
+                depth_samples: Vec::new(),
+                selected_outcomes: Some(selected.clone()),
             });
         }
 
@@ -466,10 +609,23 @@ async fn process_market(
         });
     }
 
+    let evaluation = evaluate_market(&market, &books, config);
+    let skip_reason = if evaluation.opportunities.is_empty() {
+        determine_skip_reason(config, evaluation.best_buy_candidate.as_ref())
+    } else {
+        None
+    };
     Ok(MarketScanResult {
-        opportunities: evaluate_market(&market, &books, config),
+        market_id: market.id.clone(),
+        market_question: market.question.clone(),
+        market_slug: market.slug.clone(),
+        opportunities: evaluation.opportunities,
         overheat: evaluate_overheat(&market, &books, config),
         book_age_ms: None,
+        skip_reason,
+        best_candidate: evaluation.best_buy_candidate,
+        depth_samples: evaluation.depth_samples,
+        selected_outcomes: Some(selected),
     })
 }
 
@@ -590,10 +746,95 @@ fn log_overheat(
     );
 }
 
+fn log_opportunity_skipped(
+    result: &MarketScanResult,
+    scan_id: u64,
+    run_context: &RunContext,
+    config: &Config,
+) {
+    let reason = result
+        .skip_reason
+        .map(|value| value.as_str())
+        .unwrap_or("unknown");
+    let best_candidate_json = serde_json::to_string(&result.best_candidate).unwrap_or_default();
+    let depth_samples_json = serde_json::to_string(&result.depth_samples).unwrap_or_default();
+    let unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let monotonic_ms = run_context.start.elapsed().as_millis() as u64;
+
+    let (yes_name, no_name, yes_token, no_token, fallback) = result
+        .selected_outcomes
+        .as_ref()
+        .map(|selected| {
+            (
+                selected.yes.name.as_str(),
+                selected.no.name.as_str(),
+                selected.yes.token_id.as_str(),
+                selected.no.token_id.as_str(),
+                selected.fallback,
+            )
+        })
+        .unwrap_or(("", "", "", "", false));
+
+    let required_margin_bps =
+        (config.arbitrage.min_profit + config.arbitrage.buffer_bps / 10_000.0) * 10_000.0;
+
+    info!(
+        event = "opportunity_skipped",
+        scan_id,
+        config_hash = %run_context.config_hash,
+        market_id = %result.market_id,
+        market_question = %result.market_question,
+        market_slug = result.market_slug.as_deref().unwrap_or(""),
+        skip_reason = reason,
+        yes_name,
+        no_name,
+        yes_token_id = yes_token,
+        no_token_id = no_token,
+        mapping_fallback = fallback,
+        buffer_bps = config.arbitrage.buffer_bps,
+        required_margin_bps = required_margin_bps,
+        min_notional = config.arbitrage.min_notional,
+        max_notional = config.arbitrage.max_notional,
+        book_age_ms = result.book_age_ms.unwrap_or(0),
+        best_candidate = %best_candidate_json,
+        depth_samples = %depth_samples_json,
+        decision = "skip",
+        ts_unix_ms = unix_ms,
+        monotonic_ms
+    );
+}
+
+fn determine_skip_reason(
+    config: &config::ArbitrageConfig,
+    best_candidate: Option<&arbitrage::BestCandidate>,
+) -> Option<SkipReason> {
+    let required_margin_bps =
+        (config.min_profit + config.buffer_bps / 10_000.0) * 10_000.0;
+    match best_candidate {
+        None => Some(SkipReason::NoDepth),
+        Some(candidate) => {
+            if candidate.edge_bps <= 0.0 {
+                Some(SkipReason::NoEdge)
+            } else if candidate.edge_bps < required_margin_bps {
+                Some(SkipReason::BelowBuffer)
+            } else if config.min_notional > 0.0 && candidate.total_notional < config.min_notional {
+                Some(SkipReason::BelowMinNotional)
+            } else if config.max_notional > 0.0 && candidate.total_notional > config.max_notional {
+                Some(SkipReason::AboveMaxNotional)
+            } else {
+                Some(SkipReason::NoOpportunity)
+            }
+        }
+    }
+}
+
 fn select_binary_outcomes(
     market: &polymarket::Market,
     config: &config::ArbitrageConfig,
-) -> Option<(polymarket::Outcome, polymarket::Outcome, bool)> {
+) -> Option<SelectedOutcomes> {
     if market.outcomes.len() < config.min_outcomes || market.outcomes.len() > config.max_outcomes {
         return None;
     }
@@ -614,19 +855,19 @@ fn select_binary_outcomes(
 
     if let (Some(yes), Some(no)) = (yes_idx, no_idx) {
         if yes != no {
-            return Some((
-                market.outcomes[yes].clone(),
-                market.outcomes[no].clone(),
-                false,
-            ));
+            return Some(SelectedOutcomes {
+                yes: market.outcomes[yes].clone(),
+                no: market.outcomes[no].clone(),
+                fallback: false,
+            });
         }
     }
 
-    Some((
-        market.outcomes[0].clone(),
-        market.outcomes[1].clone(),
-        true,
-    ))
+    Some(SelectedOutcomes {
+        yes: market.outcomes[0].clone(),
+        no: market.outcomes[1].clone(),
+        fallback: true,
+    })
 }
 
 fn normalize_outcome_name(name: &str) -> String {

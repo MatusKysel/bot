@@ -171,6 +171,12 @@ pub struct LoggingConfig {
     pub level: String,
     #[serde(default)]
     pub file_path: Option<String>,
+    #[serde(default = "default_log_opportunity_skipped")]
+    pub log_opportunity_skipped: bool,
+    #[serde(default = "default_log_health")]
+    pub log_health: bool,
+    #[serde(default = "default_health_log_every_scans")]
+    pub health_log_every_scans: u64,
 }
 
 impl Config {
@@ -237,6 +243,9 @@ impl Config {
                 self.arbitrage.min_notional,
                 self.arbitrage.max_notional
             ));
+        }
+        if self.logging.health_log_every_scans == 0 {
+            return Err(anyhow!("health_log_every_scans must be >= 1"));
         }
         Ok(())
     }
@@ -337,6 +346,9 @@ impl Default for LoggingConfig {
         Self {
             level: default_log_level(),
             file_path: None,
+            log_opportunity_skipped: default_log_opportunity_skipped(),
+            log_health: default_log_health(),
+            health_log_every_scans: default_health_log_every_scans(),
         }
     }
 }
@@ -579,4 +591,16 @@ fn default_selection_penalty_niche() -> f64 {
 
 fn default_log_level() -> String {
     "info".to_string()
+}
+
+fn default_log_opportunity_skipped() -> bool {
+    false
+}
+
+fn default_log_health() -> bool {
+    true
+}
+
+fn default_health_log_every_scans() -> u64 {
+    5
 }
