@@ -52,6 +52,11 @@ min_price = 0.01
 max_price = 0.99
 # Minimum bundle size (shares of each outcome) to evaluate.
 min_size = 0.0
+max_depth_levels = 50
+# Churn guards (0 = disabled)
+max_updates_per_sec = 0
+max_best_ask_flips_per_sec = 0
+max_best_bid_flips_per_sec = 0
 # Target USD notionals used to sample depth.
 target_notionals = [5.0, 25.0, 100.0]
 min_notional = 5.0
@@ -90,3 +95,6 @@ niche_keywords = []
 [logging]
 level = "info"
 file_path = ""
+log_opportunity_skipped = true
+log_health = true
+health_log_every_scans = 5

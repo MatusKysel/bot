@@ -23,6 +23,12 @@ pub struct BookState {
     pub updated_at: Instant,
     pub last_seq: Option<u64>,
     pub has_snapshot: bool,
+    pub window_start: Instant,
+    pub updates_in_window: u64,
+    pub best_bid: Option<f64>,
+    pub best_ask: Option<f64>,
+    pub best_bid_flips: u64,
+    pub best_ask_flips: u64,
 }
 
 pub type OrderbookCache = Arc<DashMap<String, BookState>>;
@@ -491,12 +497,9 @@ async fn handle_ws_value(
     let mut resync_reason = None;
     let now = Instant::now();
     {
-        let mut entry = cache.entry(event.token_id.clone()).or_insert_with(|| BookState {
-            book: Orderbook::default(),
-            updated_at: now,
-            last_seq: None,
-            has_snapshot: false,
-        });
+        let mut entry = cache
+            .entry(event.token_id.clone())
+            .or_insert_with(|| init_book_state(Orderbook::default(), now));
 
         let apply_snapshot = event.is_snapshot && event.update.asks.is_some() && event.update.bids.is_some();
         if apply_snapshot {
@@ -505,6 +508,7 @@ async fn handle_ws_value(
             entry.updated_at = now;
             entry.last_seq = event.seq;
             entry.has_snapshot = true;
+            update_churn_stats(&mut entry, now);
         } else {
             if !entry.has_snapshot {
                 resync_reason = Some("delta_without_snapshot");
@@ -530,6 +534,7 @@ async fn handle_ws_value(
                 }
                 entry.updated_at = now;
                 entry.last_seq = event.seq.or(entry.last_seq);
+                update_churn_stats(&mut entry, now);
             } else {
                 entry.has_snapshot = false;
             }
@@ -585,15 +590,10 @@ async fn schedule_resync(
             Ok(mut book) => {
                 book.asks = normalize_levels(book.asks, true);
                 book.bids = normalize_levels(book.bids, false);
-                cache.insert(
-                    token_id.clone(),
-                    BookState {
-                        book,
-                        updated_at: Instant::now(),
-                        last_seq: None,
-                        has_snapshot: true,
-                    },
-                );
+                let now = Instant::now();
+                let mut state = init_book_state(book, now);
+                state.has_snapshot = true;
+                cache.insert(token_id.clone(), state);
                 info!(
                     event = "ws_resync_done",
                     token_id = %token_id,
@@ -773,6 +773,48 @@ fn find_value<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
         }
     }
     Some(current)
+}
+
+fn init_book_state(book: Orderbook, now: Instant) -> BookState {
+    let best_ask = book.asks.first().map(|level| level.price);
+    let best_bid = book.bids.first().map(|level| level.price);
+    BookState {
+        book,
+        updated_at: now,
+        last_seq: None,
+        has_snapshot: false,
+        window_start: now,
+        updates_in_window: 0,
+        best_bid,
+        best_ask,
+        best_bid_flips: 0,
+        best_ask_flips: 0,
+    }
+}
+
+fn update_churn_stats(entry: &mut BookState, now: Instant) {
+    let window_age = now.duration_since(entry.window_start);
+    if window_age.as_secs_f64() >= 1.0 {
+        entry.window_start = now;
+        entry.updates_in_window = 0;
+        entry.best_bid_flips = 0;
+        entry.best_ask_flips = 0;
+    }
+    entry.updates_in_window += 1;
+    let current_best_ask = entry.book.asks.first().map(|level| level.price);
+    if entry.best_ask != current_best_ask {
+        if entry.best_ask.is_some() && current_best_ask.is_some() {
+            entry.best_ask_flips += 1;
+        }
+        entry.best_ask = current_best_ask;
+    }
+    let current_best_bid = entry.book.bids.first().map(|level| level.price);
+    if entry.best_bid != current_best_bid {
+        if entry.best_bid.is_some() && current_best_bid.is_some() {
+            entry.best_bid_flips += 1;
+        }
+        entry.best_bid = current_best_bid;
+    }
 }
 
 struct Backoff {

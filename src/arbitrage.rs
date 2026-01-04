@@ -11,25 +11,7 @@ pub struct OutcomeBook {
     pub bids: Vec<PriceLevel>,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct OverheatLeg {
-    pub name: String,
-    pub token_id: String,
-    pub price: f64,
-    pub size: f64,
-}
-
-#[derive(Debug, Clone)]
-pub struct OverheatSignal {
-    pub market_id: String,
-    pub market_question: String,
-    pub market_slug: Option<String>,
-    pub bid_sum: f64,
-    pub excess: f64,
-    pub min_size: f64,
-    pub legs: Vec<OverheatLeg>,
-}
-
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub enum ArbSide {
     Buy,
@@ -111,7 +93,6 @@ struct OutcomeLevels {
     unwind_price: f64,
 }
 
-const OVERHEAT_EPS: f64 = 1e-6;
 
 pub fn evaluate_market(
     market: &Market,
@@ -127,13 +108,9 @@ pub fn evaluate_market(
     }
 
     let buy_eval = evaluate_side_with_diagnostics(market, books, config, ArbSide::Buy);
-    let sell_eval = evaluate_side_with_diagnostics(market, books, config, ArbSide::Sell);
 
     let mut opportunities = Vec::new();
     if let Some(opportunity) = buy_eval.best_opportunity {
-        opportunities.push(opportunity);
-    }
-    if let Some(opportunity) = sell_eval.best_opportunity {
         opportunities.push(opportunity);
     }
 
@@ -142,47 +119,6 @@ pub fn evaluate_market(
         best_buy_candidate: buy_eval.best_candidate,
         depth_samples: buy_eval.depth_samples,
     }
-}
-
-pub fn evaluate_overheat(
-    market: &Market,
-    books: &[OutcomeBook],
-    config: &ArbitrageConfig,
-) -> Option<OverheatSignal> {
-    if books.len() < config.min_outcomes || books.len() > config.max_outcomes {
-        return None;
-    }
-
-    let mut bid_sum = 0.0;
-    let mut min_size: Option<f64> = None;
-    let mut legs = Vec::with_capacity(books.len());
-
-    for book in books {
-        let levels = sanitize_levels(&book.bids, config.min_price, config.max_price, ArbSide::Sell);
-        let best = levels.first()?;
-        bid_sum += best.price;
-        min_size = Some(min_size.map_or(best.size, |current| current.min(best.size)));
-        legs.push(OverheatLeg {
-            name: book.name.clone(),
-            token_id: book.token_id.clone(),
-            price: best.price,
-            size: best.size,
-        });
-    }
-
-    if bid_sum <= 1.0 + OVERHEAT_EPS {
-        return None;
-    }
-
-    Some(OverheatSignal {
-        market_id: market.id.clone(),
-        market_question: market.question.clone(),
-        market_slug: market.slug.clone(),
-        bid_sum,
-        excess: bid_sum - 1.0,
-        min_size: min_size.unwrap_or(0.0),
-        legs,
-    })
 }
 
 struct SideEvaluation {

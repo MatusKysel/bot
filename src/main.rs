@@ -4,7 +4,7 @@ mod market_selection;
 mod polymarket;
 mod ws_orderbook;
 
-use crate::arbitrage::{evaluate_market, evaluate_overheat, OutcomeBook, OverheatSignal};
+use crate::arbitrage::{evaluate_market, OutcomeBook};
 use crate::config::Config;
 use crate::market_selection::score_market;
 use crate::polymarket::PolymarketClient;
@@ -14,7 +14,7 @@ use clap::Parser;
 use futures::stream::{self, StreamExt};
 use serde_json;
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -28,9 +28,9 @@ struct Cli {
     config: PathBuf,
 }
 
-const OVERHEAT_FLIP_WINDOW_SECS: u64 = 60;
 static SCAN_COUNTER: AtomicU64 = AtomicU64::new(1);
 static OPP_COUNTER: AtomicU64 = AtomicU64::new(1);
+static SKIP_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 struct RunContext {
     config_hash: String,
@@ -42,12 +42,14 @@ struct MarketScanResult {
     market_question: String,
     market_slug: Option<String>,
     opportunities: Vec<arbitrage::ArbOpportunity>,
-    overheat: Option<OverheatSignal>,
     book_age_ms: Option<u64>,
     skip_reason: Option<SkipReason>,
     best_candidate: Option<arbitrage::BestCandidate>,
     depth_samples: Vec<arbitrage::DepthSample>,
     selected_outcomes: Option<SelectedOutcomes>,
+    updates_per_sec: Option<f64>,
+    best_ask_flips_per_sec: Option<f64>,
+    best_bid_flips_per_sec: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -56,6 +58,9 @@ enum SkipReason {
     MissingToken,
     MissingBook,
     StaleBook,
+    ChurnUpdates,
+    ChurnBestAsk,
+    ChurnBestBid,
     NoDepth,
     NoEdge,
     BelowBuffer,
@@ -71,6 +76,9 @@ impl SkipReason {
             SkipReason::MissingToken => "missing_token",
             SkipReason::MissingBook => "missing_book",
             SkipReason::StaleBook => "stale_book",
+            SkipReason::ChurnUpdates => "churn_updates",
+            SkipReason::ChurnBestAsk => "churn_best_ask",
+            SkipReason::ChurnBestBid => "churn_best_bid",
             SkipReason::NoDepth => "no_depth",
             SkipReason::NoEdge => "no_edge",
             SkipReason::BelowBuffer => "below_buffer",
@@ -88,39 +96,39 @@ struct SelectedOutcomes {
     fallback: bool,
 }
 
-struct OverheatState {
-    last_seen: Instant,
-    bid_sum: f64,
+#[derive(Default)]
+struct SkipCounters {
+    not_binary: usize,
+    missing_token: usize,
+    missing_book: usize,
+    stale_book: usize,
+    churn_updates: usize,
+    churn_best_ask: usize,
+    churn_best_bid: usize,
+    no_depth: usize,
+    no_edge: usize,
+    below_buffer: usize,
+    below_min_notional: usize,
+    above_max_notional: usize,
+    no_opportunity: usize,
 }
 
-struct OverheatTracker {
-    states: HashMap<String, OverheatState>,
-}
-
-impl OverheatTracker {
-    fn new() -> Self {
-        Self {
-            states: HashMap::new(),
-        }
-    }
-
-    fn record(&mut self, signal: &OverheatSignal, now: Instant) {
-        self.states.insert(
-            signal.market_id.clone(),
-            OverheatState {
-                last_seen: now,
-                bid_sum: signal.bid_sum,
-            },
-        );
-    }
-
-    fn recent(&self, market_id: &str, window: Duration, now: Instant) -> Option<(Duration, f64)> {
-        let state = self.states.get(market_id)?;
-        let age = now.duration_since(state.last_seen);
-        if age <= window {
-            Some((age, state.bid_sum))
-        } else {
-            None
+impl SkipCounters {
+    fn increment(&mut self, reason: SkipReason) {
+        match reason {
+            SkipReason::NotBinary => self.not_binary += 1,
+            SkipReason::MissingToken => self.missing_token += 1,
+            SkipReason::MissingBook => self.missing_book += 1,
+            SkipReason::StaleBook => self.stale_book += 1,
+            SkipReason::ChurnUpdates => self.churn_updates += 1,
+            SkipReason::ChurnBestAsk => self.churn_best_ask += 1,
+            SkipReason::ChurnBestBid => self.churn_best_bid += 1,
+            SkipReason::NoDepth => self.no_depth += 1,
+            SkipReason::NoEdge => self.no_edge += 1,
+            SkipReason::BelowBuffer => self.below_buffer += 1,
+            SkipReason::BelowMinNotional => self.below_min_notional += 1,
+            SkipReason::AboveMaxNotional => self.above_max_notional += 1,
+            SkipReason::NoOpportunity => self.no_opportunity += 1,
         }
     }
 }
@@ -168,6 +176,8 @@ async fn main() -> Result<()> {
         start: Instant::now(),
     };
 
+    log_config_summary(&config, &run_context.config_hash);
+
     let client = PolymarketClient::new(&config.polymarket)?;
     let ws_handle = if config.polymarket.use_websocket {
         Some(ws_orderbook::spawn_ws_orderbook(&config.polymarket)?)
@@ -187,7 +197,6 @@ async fn main() -> Result<()> {
         market_limit = config.polymarket.market_limit
     );
     let interval = config.polymarket.scan_interval_secs;
-    let mut overheat_tracker = OverheatTracker::new();
     let mut last_subscribed_tokens: HashSet<String> = HashSet::new();
     loop {
         if let Err(err) = run_scan(
@@ -195,7 +204,6 @@ async fn main() -> Result<()> {
             &config,
             &run_context,
             ws_handle.as_ref(),
-            &mut overheat_tracker,
             &mut last_subscribed_tokens,
         )
         .await
@@ -217,7 +225,6 @@ async fn run_scan(
     config: &Config,
     run_context: &RunContext,
     ws_handle: Option<&WsOrderbookHandle>,
-    overheat_tracker: &mut OverheatTracker,
     last_subscribed_tokens: &mut HashSet<String>,
 ) -> Result<()> {
     let scan_id = SCAN_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -324,12 +331,10 @@ async fn run_scan(
         .await
     };
 
-    let now = Instant::now();
-    let flip_window = Duration::from_secs(OVERHEAT_FLIP_WINDOW_SECS);
     let mut opportunities = 0usize;
     let mut books_present = 0usize;
     let mut max_book_age_ms = 0u64;
-    let mut skip_counts: HashMap<String, usize> = HashMap::new();
+    let mut skip_counts = SkipCounters::default();
     for result in results {
         match result {
             Ok(found) => {
@@ -340,12 +345,8 @@ async fn run_scan(
                     }
                 }
                 if let Some(reason) = found.skip_reason {
-                    *skip_counts
-                        .entry(reason.as_str().to_string())
-                        .or_insert(0) += 1;
-                    if config.logging.log_opportunity_skipped {
-                        log_opportunity_skipped(&found, scan_id, run_context, config);
-                    }
+                    skip_counts.increment(reason);
+                    log_opportunity_skipped(&found, scan_id, run_context, config);
                 }
                 for opportunity in found.opportunities {
                     let opp_id = OPP_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -357,23 +358,16 @@ async fn run_scan(
                         market_question = %opportunity.market_question
                     );
                     let _enter = span.enter();
-                    if let Some((age, bid_sum)) =
-                        overheat_tracker.recent(&opportunity.market_id, flip_window, now)
-                    {
-                        info!(
-                            event = "overheat_flip",
-                            age_secs = age.as_secs(),
-                            bid_sum = bid_sum,
-                            config_hash = %run_context.config_hash,
-                            monotonic_ms = run_context.start.elapsed().as_millis() as u64
-                        );
-                    }
                     opportunities += 1;
-                    log_opportunity(&opportunity, scan_id, run_context, found.book_age_ms);
-                }
-                if let Some(overheat) = found.overheat {
-                    log_overheat(&overheat, scan_id, run_context, found.book_age_ms);
-                    overheat_tracker.record(&overheat, now);
+                    log_opportunity(
+                        &opportunity,
+                        scan_id,
+                        run_context,
+                        found.book_age_ms,
+                        found.updates_per_sec,
+                        found.best_ask_flips_per_sec,
+                        found.best_bid_flips_per_sec,
+                    );
                 }
             }
             Err(err) => {
@@ -385,7 +379,6 @@ async fn run_scan(
     if config.logging.log_health
         && scan_id % config.logging.health_log_every_scans.max(1) == 0
     {
-        let skip_counts_json = serde_json::to_string(&skip_counts).unwrap_or_default();
         let (cache_size, ws_stats) = if let Some(ws) = ws_handle {
             (ws.cache_len(), Some(ws.stats_snapshot()))
         } else {
@@ -399,7 +392,19 @@ async fn run_scan(
             books_present,
             max_book_age_ms,
             cache_size,
-            skipped = %skip_counts_json,
+            skipped_not_binary = skip_counts.not_binary,
+            skipped_missing_token = skip_counts.missing_token,
+            skipped_missing_book = skip_counts.missing_book,
+            skipped_stale_book = skip_counts.stale_book,
+            skipped_no_depth = skip_counts.no_depth,
+            skipped_no_edge = skip_counts.no_edge,
+            skipped_below_buffer = skip_counts.below_buffer,
+            skipped_below_min_notional = skip_counts.below_min_notional,
+            skipped_above_max_notional = skip_counts.above_max_notional,
+            skipped_churn_updates = skip_counts.churn_updates,
+            skipped_churn_best_ask = skip_counts.churn_best_ask,
+            skipped_churn_best_bid = skip_counts.churn_best_bid,
+            skipped_no_opportunity = skip_counts.no_opportunity,
             ws_dropped_updates = ws_stats.as_ref().map(|s| s.dropped_updates).unwrap_or(0),
             ws_resyncs = ws_stats.as_ref().map(|s| s.resyncs).unwrap_or(0),
             ws_reconnects = ws_stats.as_ref().map(|s| s.reconnects).unwrap_or(0),
@@ -431,12 +436,14 @@ async fn process_market_from_cache(
                 market_question: market.question.clone(),
                 market_slug: market.slug.clone(),
                 opportunities: Vec::new(),
-                overheat: None,
                 book_age_ms: None,
                 skip_reason: Some(SkipReason::NotBinary),
                 best_candidate: None,
                 depth_samples: Vec::new(),
                 selected_outcomes: None,
+                updates_per_sec: None,
+                best_ask_flips_per_sec: None,
+                best_bid_flips_per_sec: None,
             })
         }
     };
@@ -445,6 +452,9 @@ async fn process_market_from_cache(
     let enforce_staleness = config.require_orderbook && max_quote_age.as_secs() > 0;
     let mut books = Vec::with_capacity(outcomes.len());
     let mut max_age_ms: Option<u64> = None;
+    let mut updates_per_sec: Option<f64> = None;
+    let mut best_ask_flips_per_sec: Option<f64> = None;
+    let mut best_bid_flips_per_sec: Option<f64> = None;
     for outcome in &outcomes {
         if outcome.token_id.trim().is_empty() {
             debug!("missing token id for market {}", market.id);
@@ -453,12 +463,14 @@ async fn process_market_from_cache(
                 market_question: market.question.clone(),
                 market_slug: market.slug.clone(),
                 opportunities: Vec::new(),
-                overheat: None,
                 book_age_ms: None,
                 skip_reason: Some(SkipReason::MissingToken),
                 best_candidate: None,
                 depth_samples: Vec::new(),
                 selected_outcomes: Some(selected.clone()),
+                updates_per_sec: None,
+                best_ask_flips_per_sec: None,
+                best_bid_flips_per_sec: None,
             });
         }
 
@@ -470,21 +482,37 @@ async fn process_market_from_cache(
                     market_question: market.question.clone(),
                     market_slug: market.slug.clone(),
                     opportunities: Vec::new(),
-                    overheat: None,
                     book_age_ms: None,
                     skip_reason: Some(SkipReason::StaleBook),
                     best_candidate: None,
                     depth_samples: Vec::new(),
                     selected_outcomes: Some(selected.clone()),
+                    updates_per_sec: None,
+                    best_ask_flips_per_sec: None,
+                    best_bid_flips_per_sec: None,
                 });
             }
             let age_ms = state.updated_at.elapsed().as_millis() as u64;
             max_age_ms = Some(max_age_ms.map_or(age_ms, |current| current.max(age_ms)));
+            let churn = churn_metrics_from_state(&state);
+            updates_per_sec = Some(updates_per_sec.map_or(churn.updates_per_sec, |current| {
+                current.max(churn.updates_per_sec)
+            }));
+            best_ask_flips_per_sec =
+                Some(best_ask_flips_per_sec.map_or(churn.best_ask_flips_per_sec, |current| {
+                    current.max(churn.best_ask_flips_per_sec)
+                }));
+            best_bid_flips_per_sec =
+                Some(best_bid_flips_per_sec.map_or(churn.best_bid_flips_per_sec, |current| {
+                    current.max(churn.best_bid_flips_per_sec)
+                }));
+
+            let max_levels = config.max_depth_levels;
             books.push(OutcomeBook {
                 name: outcome.name.clone(),
                 token_id: outcome.token_id.clone(),
-                asks: state.book.asks.clone(),
-                bids: state.book.bids.clone(),
+                asks: truncate_levels(&state.book.asks, max_levels),
+                bids: truncate_levels(&state.book.bids, max_levels),
             });
             continue;
         }
@@ -495,12 +523,31 @@ async fn process_market_from_cache(
             market_question: market.question.clone(),
             market_slug: market.slug.clone(),
             opportunities: Vec::new(),
-            overheat: None,
             book_age_ms: None,
             skip_reason: Some(SkipReason::MissingBook),
             best_candidate: None,
             depth_samples: Vec::new(),
             selected_outcomes: Some(selected.clone()),
+            updates_per_sec: None,
+            best_ask_flips_per_sec: None,
+            best_bid_flips_per_sec: None,
+        });
+    }
+
+    if let Some(reason) = churn_skip_reason(config, updates_per_sec, best_ask_flips_per_sec, best_bid_flips_per_sec) {
+        return Ok(MarketScanResult {
+            market_id: market.id.clone(),
+            market_question: market.question.clone(),
+            market_slug: market.slug.clone(),
+            opportunities: Vec::new(),
+            book_age_ms: max_age_ms,
+            skip_reason: Some(reason),
+            best_candidate: None,
+            depth_samples: Vec::new(),
+            selected_outcomes: Some(selected),
+            updates_per_sec,
+            best_ask_flips_per_sec,
+            best_bid_flips_per_sec,
         });
     }
 
@@ -515,12 +562,14 @@ async fn process_market_from_cache(
         market_question: market.question.clone(),
         market_slug: market.slug.clone(),
         opportunities: evaluation.opportunities,
-        overheat: evaluate_overheat(&market, &books, config),
         book_age_ms: max_age_ms,
         skip_reason,
         best_candidate: evaluation.best_buy_candidate,
         depth_samples: evaluation.depth_samples,
         selected_outcomes: Some(selected),
+        updates_per_sec,
+        best_ask_flips_per_sec,
+        best_bid_flips_per_sec,
     })
 }
 
@@ -572,12 +621,14 @@ async fn process_market(
                 market_question: market.question.clone(),
                 market_slug: market.slug.clone(),
                 opportunities: Vec::new(),
-                overheat: None,
                 book_age_ms: None,
                 skip_reason: Some(SkipReason::NotBinary),
                 best_candidate: None,
                 depth_samples: Vec::new(),
                 selected_outcomes: None,
+                updates_per_sec: None,
+                best_ask_flips_per_sec: None,
+                best_bid_flips_per_sec: None,
             })
         }
     };
@@ -591,21 +642,24 @@ async fn process_market(
                 market_question: market.question.clone(),
                 market_slug: market.slug.clone(),
                 opportunities: Vec::new(),
-                overheat: None,
                 book_age_ms: None,
                 skip_reason: Some(SkipReason::MissingToken),
                 best_candidate: None,
                 depth_samples: Vec::new(),
                 selected_outcomes: Some(selected.clone()),
+                updates_per_sec: None,
+                best_ask_flips_per_sec: None,
+                best_bid_flips_per_sec: None,
             });
         }
 
         let book = client.fetch_orderbook(&outcome.token_id).await?;
+        let max_levels = config.max_depth_levels;
         books.push(OutcomeBook {
             name: outcome.name.clone(),
             token_id: outcome.token_id,
-            asks: book.asks,
-            bids: book.bids,
+            asks: truncate_levels(&book.asks, max_levels),
+            bids: truncate_levels(&book.bids, max_levels),
         });
     }
 
@@ -620,12 +674,14 @@ async fn process_market(
         market_question: market.question.clone(),
         market_slug: market.slug.clone(),
         opportunities: evaluation.opportunities,
-        overheat: evaluate_overheat(&market, &books, config),
         book_age_ms: None,
         skip_reason,
         best_candidate: evaluation.best_buy_candidate,
         depth_samples: evaluation.depth_samples,
         selected_outcomes: Some(selected),
+        updates_per_sec: None,
+        best_ask_flips_per_sec: None,
+        best_bid_flips_per_sec: None,
     })
 }
 
@@ -634,6 +690,9 @@ fn log_opportunity(
     scan_id: u64,
     run_context: &RunContext,
     book_age_ms: Option<u64>,
+    updates_per_sec: Option<f64>,
+    best_ask_flips_per_sec: Option<f64>,
+    best_bid_flips_per_sec: Option<f64>,
 ) {
     let side = match opportunity.side {
         arbitrage::ArbSide::Buy => "buy",
@@ -644,8 +703,6 @@ fn log_opportunity(
         arbitrage::ArbSide::Sell => opportunity.bundle_price_after_fees - 1.0,
     };
     let edge_bps = edge * 10_000.0;
-    let legs_json = serde_json::to_string(&opportunity.legs).unwrap_or_default();
-    let depth_samples_json = serde_json::to_string(&opportunity.depth_samples).unwrap_or_default();
     let unix_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -676,12 +733,49 @@ fn log_opportunity(
         buffer_bps = opportunity.buffer_bps,
         required_margin_bps = opportunity.required_margin_bps,
         book_age_ms = book_age_ms.unwrap_or(0),
+        updates_per_sec = updates_per_sec.unwrap_or(0.0),
+        best_ask_flips_per_sec = best_ask_flips_per_sec.unwrap_or(0.0),
+        best_bid_flips_per_sec = best_bid_flips_per_sec.unwrap_or(0.0),
         decision = "take",
-        depth_samples = %depth_samples_json,
-        legs = %legs_json,
         ts_unix_ms = unix_ms,
         monotonic_ms
     );
+
+    for (idx, leg) in opportunity.legs.iter().enumerate() {
+        info!(
+            event = "opportunity_leg",
+            scan_id,
+            market_id = %opportunity.market_id,
+            side,
+            leg_index = idx,
+            name = %leg.name,
+            token_id = %leg.token_id,
+            avg_price = leg.avg_price,
+            limit_price = leg.limit_price,
+            unwind_price = leg.unwind_price,
+            size = leg.size,
+            levels_used = leg.levels_used,
+            ts_unix_ms = unix_ms,
+            monotonic_ms
+        );
+    }
+
+    for sample in &opportunity.depth_samples {
+        info!(
+            event = "opportunity_depth_sample",
+            scan_id,
+            market_id = %opportunity.market_id,
+            decision = "take",
+            target_notional = sample.target_notional,
+            size = sample.size,
+            total_notional = sample.total_notional,
+            bundle_price = sample.bundle_price,
+            bundle_price_after_fees = sample.bundle_price_after_fees,
+            edge_bps = sample.edge_bps,
+            ts_unix_ms = unix_ms,
+            monotonic_ms
+        );
+    }
 
     info!(
         event = "paper_orders_submitted",
@@ -690,7 +784,6 @@ fn log_opportunity(
         side,
         size = opportunity.size,
         probe_size = opportunity.probe_size,
-        legs = %legs_json,
         submit_latency_ms = 0u64,
         decision_latency_ms = 0u64,
         ts_unix_ms = unix_ms,
@@ -716,36 +809,6 @@ fn log_opportunity(
     );
 }
 
-fn log_overheat(
-    signal: &OverheatSignal,
-    scan_id: u64,
-    run_context: &RunContext,
-    book_age_ms: Option<u64>,
-) {
-    let legs_json = serde_json::to_string(&signal.legs).unwrap_or_default();
-    let unix_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-    let monotonic_ms = run_context.start.elapsed().as_millis() as u64;
-
-    info!(
-        event = "overheat_detected",
-        scan_id,
-        config_hash = %run_context.config_hash,
-        market_id = %signal.market_id,
-        market_question = %signal.market_question,
-        market_slug = signal.market_slug.as_deref().unwrap_or(""),
-        bid_sum = signal.bid_sum,
-        excess = signal.excess,
-        min_size = signal.min_size,
-        book_age_ms = book_age_ms.unwrap_or(0),
-        legs = %legs_json,
-        ts_unix_ms = unix_ms,
-        monotonic_ms
-    );
-}
-
 fn log_opportunity_skipped(
     result: &MarketScanResult,
     scan_id: u64,
@@ -756,8 +819,6 @@ fn log_opportunity_skipped(
         .skip_reason
         .map(|value| value.as_str())
         .unwrap_or("unknown");
-    let best_candidate_json = serde_json::to_string(&result.best_candidate).unwrap_or_default();
-    let depth_samples_json = serde_json::to_string(&result.depth_samples).unwrap_or_default();
     let unix_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -781,9 +842,25 @@ fn log_opportunity_skipped(
     let required_margin_bps =
         (config.arbitrage.min_profit + config.arbitrage.buffer_bps / 10_000.0) * 10_000.0;
 
+    let (candidate_size, candidate_total_notional, candidate_edge_bps, candidate_margin_bps) =
+        result
+            .best_candidate
+            .as_ref()
+            .map(|candidate| {
+                (
+                    candidate.size,
+                    candidate.total_notional,
+                    candidate.edge_bps,
+                    candidate.margin_bps,
+                )
+            })
+            .unwrap_or((0.0, 0.0, 0.0, 0.0));
+    let skip_id = SKIP_COUNTER.fetch_add(1, Ordering::Relaxed);
+
     info!(
         event = "opportunity_skipped",
         scan_id,
+        skip_id,
         config_hash = %run_context.config_hash,
         market_id = %result.market_id,
         market_question = %result.market_question,
@@ -798,13 +875,37 @@ fn log_opportunity_skipped(
         required_margin_bps = required_margin_bps,
         min_notional = config.arbitrage.min_notional,
         max_notional = config.arbitrage.max_notional,
+        candidate_size,
+        candidate_total_notional,
+        candidate_edge_bps,
+        candidate_margin_bps,
         book_age_ms = result.book_age_ms.unwrap_or(0),
-        best_candidate = %best_candidate_json,
-        depth_samples = %depth_samples_json,
+        updates_per_sec = result.updates_per_sec.unwrap_or(0.0),
+        best_ask_flips_per_sec = result.best_ask_flips_per_sec.unwrap_or(0.0),
+        best_bid_flips_per_sec = result.best_bid_flips_per_sec.unwrap_or(0.0),
         decision = "skip",
         ts_unix_ms = unix_ms,
         monotonic_ms
     );
+
+    for sample in &result.depth_samples {
+        info!(
+            event = "opportunity_depth_sample",
+            scan_id,
+            skip_id,
+            market_id = %result.market_id,
+            decision = "skip",
+            skip_reason = reason,
+            target_notional = sample.target_notional,
+            size = sample.size,
+            total_notional = sample.total_notional,
+            bundle_price = sample.bundle_price,
+            bundle_price_after_fees = sample.bundle_price_after_fees,
+            edge_bps = sample.edge_bps,
+            ts_unix_ms = unix_ms,
+            monotonic_ms
+        );
+    }
 }
 
 fn determine_skip_reason(
@@ -829,6 +930,88 @@ fn determine_skip_reason(
             }
         }
     }
+}
+
+fn log_config_summary(config: &Config, config_hash: &str) {
+    let gamma_query = serde_json::to_string(&config.polymarket.gamma_query).unwrap_or_default();
+    let target_notionals =
+        serde_json::to_string(&config.arbitrage.target_notionals).unwrap_or_default();
+    info!(
+        event = "config_loaded",
+        config_hash = %config_hash,
+        ws_url = %config.polymarket.ws_url,
+        market_category = %config.polymarket.market_category,
+        market_limit = config.polymarket.market_limit,
+        scan_interval_secs = config.polymarket.scan_interval_secs,
+        max_quote_age_secs = config.polymarket.max_quote_age_secs,
+        max_concurrent_orderbook_requests = config.polymarket.max_concurrent_orderbook_requests,
+        gamma_query = %gamma_query,
+        min_profit = config.arbitrage.min_profit,
+        buffer_bps = config.arbitrage.buffer_bps,
+        fee_bps = config.arbitrage.fee_bps,
+        min_notional = config.arbitrage.min_notional,
+        max_notional = config.arbitrage.max_notional,
+        max_depth_levels = config.arbitrage.max_depth_levels,
+        max_updates_per_sec = config.arbitrage.max_updates_per_sec,
+        max_best_ask_flips_per_sec = config.arbitrage.max_best_ask_flips_per_sec,
+        max_best_bid_flips_per_sec = config.arbitrage.max_best_bid_flips_per_sec,
+        target_notionals = %target_notionals,
+        log_opportunity_skipped = config.logging.log_opportunity_skipped,
+        log_health = config.logging.log_health,
+        health_log_every_scans = config.logging.health_log_every_scans
+    );
+}
+
+struct BookChurn {
+    updates_per_sec: f64,
+    best_ask_flips_per_sec: f64,
+    best_bid_flips_per_sec: f64,
+}
+
+fn churn_metrics_from_state(state: &ws_orderbook::BookState) -> BookChurn {
+    let window_age = state
+        .updated_at
+        .duration_since(state.window_start)
+        .as_secs_f64()
+        .max(0.001);
+    BookChurn {
+        updates_per_sec: state.updates_in_window as f64 / window_age,
+        best_ask_flips_per_sec: state.best_ask_flips as f64 / window_age,
+        best_bid_flips_per_sec: state.best_bid_flips as f64 / window_age,
+    }
+}
+
+fn churn_skip_reason(
+    config: &config::ArbitrageConfig,
+    updates_per_sec: Option<f64>,
+    best_ask_flips_per_sec: Option<f64>,
+    best_bid_flips_per_sec: Option<f64>,
+) -> Option<SkipReason> {
+    if let Some(rate) = updates_per_sec {
+        if config.max_updates_per_sec > 0 && rate > config.max_updates_per_sec as f64 {
+            return Some(SkipReason::ChurnUpdates);
+        }
+    }
+    if let Some(rate) = best_ask_flips_per_sec {
+        if config.max_best_ask_flips_per_sec > 0 && rate > config.max_best_ask_flips_per_sec as f64
+        {
+            return Some(SkipReason::ChurnBestAsk);
+        }
+    }
+    if let Some(rate) = best_bid_flips_per_sec {
+        if config.max_best_bid_flips_per_sec > 0 && rate > config.max_best_bid_flips_per_sec as f64
+        {
+            return Some(SkipReason::ChurnBestBid);
+        }
+    }
+    None
+}
+
+fn truncate_levels(levels: &[polymarket::PriceLevel], max_levels: usize) -> Vec<polymarket::PriceLevel> {
+    if max_levels == 0 || levels.len() <= max_levels {
+        return levels.to_vec();
+    }
+    levels[..max_levels].to_vec()
 }
 
 fn select_binary_outcomes(

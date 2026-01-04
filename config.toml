@@ -24,7 +24,7 @@ max_quote_age_secs = 5
 # Adds end_date_max=now+25h to Gamma query when set.
 gamma_end_date_max_hours = 25
 market_category = "Crypto"
-market_limit = 200
+market_limit = 50
 request_timeout_secs = 20
 scan_interval_secs = 2
 max_concurrent_orderbook_requests = 8
@@ -32,8 +32,8 @@ user_agent = "polymarket-arb-bot/0.1"
 
 [polymarket.gamma_query]
 closed = "false"
-liquidity_num_min = "20000"
-volume_num_min = "20000"
+liquidity_num_min = "50000"
+volume_num_min = "100000"
 order = "volume24hrClob"
 ascending = "false"
 # tag_id = "<TAG_ID>"
@@ -44,7 +44,7 @@ ascending = "false"
 
 [arbitrage]
 min_profit = 0.0
-buffer_bps = 0.0
+buffer_bps = 8.0
 fee_bps = 0.0
 min_outcomes = 2
 max_outcomes = 2
@@ -52,9 +52,14 @@ min_price = 0.01
 max_price = 0.99
 # Minimum bundle size (shares of each outcome) to evaluate.
 min_size = 0.0
+max_depth_levels = 50
+# Churn guards (0 = disabled)
+max_updates_per_sec = 0
+max_best_ask_flips_per_sec = 0
+max_best_bid_flips_per_sec = 0
 # Target USD notionals used to sample depth.
 target_notionals = [5.0, 25.0, 100.0]
-min_notional = 1.0
+min_notional = 5.0
 max_notional = 250.0
 require_orderbook = true
 # Two-phase execution plan settings (theoretical).
@@ -90,4 +95,6 @@ niche_keywords = []
 [logging]
 level = "info"
 file_path = ""
+log_health = true
+health_log_every_scans = 5
 log_opportunity_skipped = true

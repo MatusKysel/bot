@@ -103,6 +103,14 @@ pub struct ArbitrageConfig {
     pub max_price: f64,
     #[serde(default = "default_min_size")]
     pub min_size: f64,
+    #[serde(default = "default_max_depth_levels")]
+    pub max_depth_levels: usize,
+    #[serde(default = "default_max_updates_per_sec")]
+    pub max_updates_per_sec: u64,
+    #[serde(default = "default_max_best_ask_flips_per_sec")]
+    pub max_best_ask_flips_per_sec: u64,
+    #[serde(default = "default_max_best_bid_flips_per_sec")]
+    pub max_best_bid_flips_per_sec: u64,
     #[serde(default = "default_target_notionals")]
     pub target_notionals: Vec<f64>,
     #[serde(default = "default_min_notional")]
@@ -247,6 +255,11 @@ impl Config {
         if self.logging.health_log_every_scans == 0 {
             return Err(anyhow!("health_log_every_scans must be >= 1"));
         }
+        if !self.logging.log_opportunity_skipped {
+            return Err(anyhow!(
+                "log_opportunity_skipped must be true to satisfy required logging"
+            ));
+        }
         Ok(())
     }
 }
@@ -302,6 +315,10 @@ impl Default for ArbitrageConfig {
             min_price: default_min_price(),
             max_price: default_max_price(),
             min_size: default_min_size(),
+            max_depth_levels: default_max_depth_levels(),
+            max_updates_per_sec: default_max_updates_per_sec(),
+            max_best_ask_flips_per_sec: default_max_best_ask_flips_per_sec(),
+            max_best_bid_flips_per_sec: default_max_best_bid_flips_per_sec(),
             target_notionals: default_target_notionals(),
             min_notional: default_min_notional(),
             max_notional: default_max_notional(),
@@ -497,6 +514,22 @@ fn default_min_size() -> f64 {
     0.0
 }
 
+fn default_max_depth_levels() -> usize {
+    50
+}
+
+fn default_max_updates_per_sec() -> u64 {
+    0
+}
+
+fn default_max_best_ask_flips_per_sec() -> u64 {
+    0
+}
+
+fn default_max_best_bid_flips_per_sec() -> u64 {
+    0
+}
+
 fn default_target_notionals() -> Vec<f64> {
     vec![5.0, 25.0, 100.0]
 }
@@ -594,7 +627,7 @@ fn default_log_level() -> String {
 }
 
 fn default_log_opportunity_skipped() -> bool {
-    false
+    true
 }
 
 fn default_log_health() -> bool {
