@@ -1,0 +1,92 @@
+[polymarket]
+gamma_base_url = "https://gamma-api.polymarket.com"
+gamma_markets_path = "/markets"
+clob_base_url = "https://clob.polymarket.com"
+orderbook_path = "/book"
+orderbook_token_param = "token_id"
+use_websocket = true
+ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+ws_message_type = "MARKET"
+ws_asset_ids_field = "asset_ids"
+ws_operation_field = "operation"
+ws_subscribe_operation = "subscribe"
+ws_unsubscribe_operation = "unsubscribe"
+ws_use_operation_on_connect = false
+ws_subscribe_batch_size = 25
+ws_subscribe_delay_ms = 100
+ws_reconnect_delay_secs = 5
+ws_reconnect_backoff_min_ms = 500
+ws_reconnect_backoff_max_ms = 30000
+ws_reconnect_jitter_ms = 250
+ws_ping_interval_secs = 20
+ws_update_queue_capacity = 2048
+max_quote_age_secs = 5
+# Adds end_date_max=now+25h to Gamma query when set.
+gamma_end_date_max_hours = 25
+market_category = "Crypto"
+market_limit = 50
+request_timeout_secs = 20
+scan_interval_secs = 2
+max_concurrent_orderbook_requests = 8
+user_agent = "polymarket-arb-bot/0.1"
+
+[polymarket.gamma_query]
+closed = "false"
+liquidity_num_min = "50000"
+volume_num_min = "100000"
+order = "volume24hrClob"
+ascending = "false"
+# tag_id = "<TAG_ID>"
+
+[polymarket.ws_subscribe_extra]
+# Some WS servers require extra keys on subscribe messages.
+# example_key = "example_value"
+
+[arbitrage]
+min_profit = 0.0
+buffer_bps = 8.0
+fee_bps = 0.0
+min_outcomes = 2
+max_outcomes = 2
+min_price = 0.01
+max_price = 0.99
+# Minimum bundle size (shares of each outcome) to evaluate.
+min_size = 0.0
+# Target USD notionals used to sample depth.
+target_notionals = [5.0, 25.0, 100.0]
+min_notional = 5.0
+max_notional = 250.0
+require_orderbook = true
+# Two-phase execution plan settings (theoretical).
+probe_fraction = 0.1
+probe_min_size = 5.0
+probe_max_wait_ms = 1500
+
+[selection]
+# Set to > 0 to enforce market selection filtering. Set thresholds to 0 to disable them.
+min_score = 0.0
+min_volume = 50000.0
+min_volume_24h = 5000.0
+min_liquidity = 10000.0
+min_traders = 100
+consensus_threshold = 0.1
+bonus_volume = 1.0
+bonus_volume_24h = 0.6
+bonus_liquidity = 0.8
+bonus_retail = 0.7
+bonus_boring = 0.6
+bonus_consensus = 0.8
+penalty_breaking = 1.6
+penalty_legal = 1.2
+penalty_election = 1.2
+penalty_niche = 0.8
+# Keywords are case-insensitive substring matches.
+boring_keywords = ["cpi", "inflation", "gdp", "unemployment", "interest rate", "fomc"]
+breaking_keywords = ["breaking", "urgent", "developing", "live"]
+legal_keywords = ["court", "lawsuit", "trial", "judge", "ruling", "verdict", "indict"]
+election_keywords = ["election", "primary", "runoff", "poll", "ballot", "vote"]
+niche_keywords = []
+
+[logging]
+level = "info"
+file_path = ""
