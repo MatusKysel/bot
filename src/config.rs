@@ -174,14 +174,6 @@ pub struct LoggingConfig {
 }
 
 impl Config {
-    pub fn from_path(path: &Path) -> Result<Self> {
-        let contents = std::fs::read_to_string(path)
-            .with_context(|| format!("read config file {}", path.display()))?;
-        let config: Config = toml::from_str(&contents)
-            .with_context(|| format!("parse config file {}", path.display()))?;
-        Ok(config)
-    }
-
     pub fn from_path_with_hash(path: &Path) -> Result<(Self, String)> {
         let contents = std::fs::read_to_string(path)
             .with_context(|| format!("read config file {}", path.display()))?;

@@ -1,5 +1,6 @@
 use crate::config::ArbitrageConfig;
 use crate::polymarket::{Market, PriceLevel};
+use serde::Serialize;
 use std::cmp::Ordering;
 
 #[derive(Debug, Clone)]
@@ -10,7 +11,7 @@ pub struct OutcomeBook {
     pub bids: Vec<PriceLevel>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct OverheatLeg {
     pub name: String,
     pub token_id: String,
@@ -35,7 +36,7 @@ pub enum ArbSide {
     Sell,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct LegExecution {
     pub name: String,
     pub token_id: String,
@@ -44,6 +45,16 @@ pub struct LegExecution {
     pub unwind_price: f64,
     pub size: f64,
     pub levels_used: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DepthSample {
+    pub target_notional: f64,
+    pub size: f64,
+    pub total_notional: f64,
+    pub bundle_price: f64,
+    pub bundle_price_after_fees: f64,
+    pub edge_bps: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -63,6 +74,9 @@ pub struct ArbOpportunity {
     pub margin: f64,
     pub margin_bps: f64,
     pub fee_bps: f64,
+    pub buffer_bps: f64,
+    pub required_margin_bps: f64,
+    pub depth_samples: Vec<DepthSample>,
     pub legs: Vec<LegExecution>,
 }
 
@@ -156,13 +170,21 @@ fn evaluate_side(
     }
 
     // Profit is piecewise linear across depth breakpoints; sample those + min_size.
-    let sizes = candidate_sizes(&outcomes, max_size, config.min_size);
+    let sizes = candidate_sizes(
+        &outcomes,
+        max_size,
+        config.min_size,
+        &config.target_notionals,
+    );
     if sizes.is_empty() {
         return None;
     }
 
     let fee_multiplier = config.fee_bps / 10_000.0;
+    let buffer_margin = config.buffer_bps / 10_000.0;
+    let required_margin = config.min_profit + buffer_margin;
     let mut best: Option<ArbOpportunity> = None;
+    let mut cost_candidates: Vec<CostCandidate> = Vec::new();
 
     for size in sizes {
         let mut total_notional = 0.0;
@@ -203,17 +225,31 @@ fn evaluate_side(
             ArbSide::Sell => total_after_fees - size,
         };
 
+        let bundle_price = total_notional / size;
+        let bundle_price_after_fees = total_after_fees / size;
+
+        cost_candidates.push(CostCandidate {
+            size,
+            total_notional,
+            bundle_price,
+            bundle_price_after_fees,
+        });
+
         if profit <= 0.0 {
             continue;
         }
 
         let margin = profit / size;
-        if margin < config.min_profit {
+        if margin < required_margin {
             continue;
         }
 
-        let bundle_price = total_notional / size;
-        let bundle_price_after_fees = total_after_fees / size;
+        if config.min_notional > 0.0 && total_notional < config.min_notional {
+            continue;
+        }
+        if config.max_notional > 0.0 && total_notional > config.max_notional {
+            continue;
+        }
 
         let probe_size = compute_probe_size(size, config);
         let opportunity = ArbOpportunity {
@@ -232,6 +268,9 @@ fn evaluate_side(
             margin,
             margin_bps: margin * 10_000.0,
             fee_bps: config.fee_bps,
+            buffer_bps: config.buffer_bps,
+            required_margin_bps: required_margin * 10_000.0,
+            depth_samples: Vec::new(),
             legs,
         };
 
@@ -253,7 +292,12 @@ fn evaluate_side(
         }
     }
 
-    best
+    if let Some(mut best) = best {
+        best.depth_samples = build_depth_samples(&cost_candidates, &config.target_notionals, side);
+        Some(best)
+    } else {
+        None
+    }
 }
 
 fn prepare_outcomes(
@@ -388,7 +432,12 @@ fn max_bundle_size(outcomes: &[OutcomeLevels]) -> Option<f64> {
         })
 }
 
-fn candidate_sizes(outcomes: &[OutcomeLevels], max_size: f64, min_size: f64) -> Vec<f64> {
+fn candidate_sizes(
+    outcomes: &[OutcomeLevels],
+    max_size: f64,
+    min_size: f64,
+    target_notionals: &[f64],
+) -> Vec<f64> {
     let mut sizes = Vec::new();
     for outcome in outcomes {
         let mut cumulative = 0.0;
@@ -402,6 +451,23 @@ fn candidate_sizes(outcomes: &[OutcomeLevels], max_size: f64, min_size: f64) -> 
         sizes.push(min_size);
     }
     sizes.push(max_size);
+
+    if !target_notionals.is_empty() {
+        let mut best_bundle_price = 0.0;
+        for outcome in outcomes {
+            if let Some(level) = outcome.levels.first() {
+                best_bundle_price += level.price;
+            }
+        }
+        if best_bundle_price > 0.0 {
+            for target in target_notionals {
+                if *target <= 0.0 {
+                    continue;
+                }
+                sizes.push(target / best_bundle_price);
+            }
+        }
+    }
 
     sizes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
     sizes.dedup_by(|a, b| (*a - *b).abs() <= 1e-9);
@@ -458,109 +524,102 @@ fn compute_probe_size(size: f64, config: &ArbitrageConfig) -> f64 {
     }
 }
 
-impl ArbOpportunity {
-    pub fn format_log(&self) -> String {
-        let mut lines = Vec::new();
-        let slug = self
-            .market_slug
-            .as_deref()
-            .map(|value| format!(" slug={value}"))
-            .unwrap_or_default();
-        let side = match self.side {
-            ArbSide::Buy => "BUY",
-            ArbSide::Sell => "SELL",
-        };
-        let bundle_label = match self.side {
-            ArbSide::Buy => "bundle_cost",
-            ArbSide::Sell => "bundle_revenue",
-        };
-        let bundle_fees_label = match self.side {
-            ArbSide::Buy => "bundle_cost_fees",
-            ArbSide::Sell => "bundle_revenue_fees",
-        };
-        let total_fees_label = match self.side {
-            ArbSide::Buy => "total_cost_fees",
-            ArbSide::Sell => "total_revenue_fees",
-        };
-
-        lines.push(format!(
-            "Arbitrage {}: market=\"{}\"{} size={:.4} {}={:.4} {}={:.4} {}={:.4} profit={:.4} margin={:.2}% fee_bps={:.1}",
-            side,
-            self.market_question,
-            slug,
-            self.size,
-            bundle_label,
-            self.bundle_price,
-            bundle_fees_label,
-            self.bundle_price_after_fees,
-            total_fees_label,
-            self.total_after_fees,
-            self.profit,
-            self.margin * 100.0,
-            self.fee_bps,
-        ));
-        lines.push(format!(
-            "  phase1: probe_size={:.4} max_wait_ms={} | phase2: scale_size={:.4} (abort if any leg lags)",
-            self.probe_size, self.probe_max_wait_ms, self.size
-        ));
-        let unwind_action = match self.side {
-            ArbSide::Buy => "sell",
-            ArbSide::Sell => "buy",
-        };
-        let unwind_label = match self.side {
-            ArbSide::Buy => "best_bid",
-            ArbSide::Sell => "best_ask",
-        };
-        lines.push(format!(
-            "  unwind: if any leg fills solo, {} immediately at {}",
-            unwind_action, unwind_label
-        ));
-
-        let action = match self.side {
-            ArbSide::Buy => "buy",
-            ArbSide::Sell => "sell",
-        };
-
-        for leg in &self.legs {
-            lines.push(format!(
-                "  {} {} avg={:.4} levels={} limit={:.4} probe={:.4} scale={:.4} unwind_{}={:.4} token={}",
-                action,
-                leg.name,
-                leg.avg_price,
-                leg.levels_used,
-                leg.limit_price,
-                self.probe_size,
-                leg.size,
-                unwind_label,
-                leg.unwind_price,
-                leg.token_id
-            ));
-        }
-
-        lines.join("\n")
-    }
+#[derive(Debug, Clone)]
+struct CostCandidate {
+    size: f64,
+    total_notional: f64,
+    bundle_price: f64,
+    bundle_price_after_fees: f64,
 }
 
-impl OverheatSignal {
-    pub fn format_log(&self) -> String {
-        let mut lines = Vec::new();
-        let slug = self
-            .market_slug
-            .as_deref()
-            .map(|value| format!(" slug={value}"))
-            .unwrap_or_default();
-        lines.push(format!(
-            "Overheated: market=\"{}\"{} bid_sum={:.4} excess={:.4} min_size={:.4}",
-            self.market_question, slug, self.bid_sum, self.excess, self.min_size
-        ));
+fn build_depth_samples(
+    candidates: &[CostCandidate],
+    target_notionals: &[f64],
+    side: ArbSide,
+) -> Vec<DepthSample> {
+    if candidates.is_empty() || target_notionals.is_empty() {
+        return Vec::new();
+    }
 
-        for leg in &self.legs {
-            lines.push(format!(
-                "  bid {} @ {:.4} size={:.4} token={}",
-                leg.name, leg.price, leg.size, leg.token_id
-            ));
+    let mut samples = Vec::new();
+    for target in target_notionals {
+        if *target <= 0.0 {
+            continue;
         }
+        let mut best: Option<&CostCandidate> = None;
+        let mut best_diff = f64::INFINITY;
+        for candidate in candidates {
+            let diff = (candidate.total_notional - target).abs();
+            if diff < best_diff {
+                best_diff = diff;
+                best = Some(candidate);
+            }
+        }
+        if let Some(candidate) = best {
+            let edge = match side {
+                ArbSide::Buy => 1.0 - candidate.bundle_price_after_fees,
+                ArbSide::Sell => candidate.bundle_price_after_fees - 1.0,
+            };
+            samples.push(DepthSample {
+                target_notional: *target,
+                size: candidate.size,
+                total_notional: candidate.total_notional,
+                bundle_price: candidate.bundle_price,
+                bundle_price_after_fees: candidate.bundle_price_after_fees,
+                edge_bps: edge * 10_000.0,
+            });
+        }
+    }
+    samples
+}
 
-        lines.join("\n")
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn walk_levels_consumes_depth() {
+        let levels = vec![
+            Level {
+                price: 0.40,
+                size: 5.0,
+            },
+            Level {
+                price: 0.50,
+                size: 5.0,
+            },
+        ];
+        let (notional, avg_price, levels_used, limit_price) =
+            walk_levels(&levels, 6.0).expect("walk levels");
+        assert!((notional - 2.5).abs() < 1e-9);
+        assert!((avg_price - (2.5 / 6.0)).abs() < 1e-9);
+        assert_eq!(levels_used, 2);
+        assert!((limit_price - 0.50).abs() < 1e-9);
+    }
+
+    #[test]
+    fn candidate_sizes_include_targets() {
+        let outcomes = vec![
+            OutcomeLevels {
+                name: "YES".to_string(),
+                token_id: "y".to_string(),
+                levels: vec![Level {
+                    price: 0.40,
+                    size: 10.0,
+                }],
+                unwind_price: 0.30,
+            },
+            OutcomeLevels {
+                name: "NO".to_string(),
+                token_id: "n".to_string(),
+                levels: vec![Level {
+                    price: 0.60,
+                    size: 10.0,
+                }],
+                unwind_price: 0.70,
+            },
+        ];
+        let sizes = candidate_sizes(&outcomes, 10.0, 0.0, &[10.0]);
+        assert!(sizes.iter().any(|size| (*size - 10.0).abs() < 1e-9));
     }
 }

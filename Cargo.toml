@@ -20,5 +20,13 @@ tokio-tungstenite = { version = "0.23", features = ["rustls-tls-webpki-roots"] }
 toml = "0.8"
 tracing = "0.1"
 tracing-appender = "0.2"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "time"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "time", "json"] }
 time = { version = "0.3", features = ["formatting"] }
+
+[profile.maxperf]
+inherits = "release"
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+incremental = false

@@ -12,13 +12,14 @@ use crate::ws_orderbook::WsOrderbookHandle;
 use anyhow::{Context, Result};
 use clap::Parser;
 use futures::stream::{self, StreamExt};
+use serde_json;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
-use tracing_subscriber::fmt::writer::MakeWriterExt;
+use tracing_subscriber::fmt::writer::{BoxMakeWriter, MakeWriterExt};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Polymarket crypto arbitrage scanner")]
@@ -39,6 +40,7 @@ struct RunContext {
 struct MarketScanResult {
     opportunities: Vec<arbitrage::ArbOpportunity>,
     overheat: Option<OverheatSignal>,
+    book_age_ms: Option<u64>,
 }
 
 struct OverheatState {
@@ -95,7 +97,7 @@ async fn main() -> Result<()> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(config.logging.level.clone()));
     let mut file_guard = None;
-    let subscriber = if let Some(path) = config.logging.file_path.clone() {
+    let writer: BoxMakeWriter = if let Some(path) = config.logging.file_path.clone() {
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -103,18 +105,18 @@ async fn main() -> Result<()> {
             .with_context(|| format!("open log file {}", path))?;
         let (file_writer, guard) = tracing_appender::non_blocking(file);
         file_guard = Some(guard);
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_target(false)
-            .json()
-            .with_writer(std::io::stdout.and(file_writer))
+        BoxMakeWriter::new(std::io::stdout.and(file_writer))
     } else {
-        tracing_subscriber::fmt()
-            .with_env_filter(filter)
-            .with_target(false)
-            .json()
+        BoxMakeWriter::new(std::io::stdout)
     };
-    subscriber.init();
+
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .json()
+        .with_current_span(true)
+        .with_writer(writer)
+        .init();
 
     let run_context = RunContext {
         config_hash,
@@ -239,9 +241,9 @@ async fn run_scan(
 
     let max_concurrency = config.polymarket.max_concurrent_orderbook_requests.max(1);
     let results = if let Some(ws) = ws_handle {
-        let token_ids = collect_token_ids(&selected, &config.arbitrage);
+        let token_ids = collect_token_ids(&selected, &config.arbitrage, scan_id);
         if !token_ids.is_empty() {
-            ws.subscribe_tokens(token_ids).await?;
+            ws.subscribe_tokens(token_ids.clone()).await?;
         }
         let desired_tokens: HashSet<String> = token_ids.into_iter().collect();
         let to_unsubscribe: Vec<String> = last_subscribed_tokens
@@ -282,7 +284,7 @@ async fn run_scan(
     for result in results {
         match result {
             Ok(found) => {
-                for opportunity in &found.opportunities {
+                for opportunity in found.opportunities {
                     let opp_id = OPP_COUNTER.fetch_add(1, Ordering::Relaxed);
                     let span = tracing::info_span!(
                         "opportunity",
@@ -299,16 +301,15 @@ async fn run_scan(
                             event = "overheat_flip",
                             age_secs = age.as_secs(),
                             bid_sum = bid_sum,
+                            config_hash = %run_context.config_hash,
                             monotonic_ms = run_context.start.elapsed().as_millis() as u64
                         );
                     }
-                }
-                for opportunity in found.opportunities {
                     opportunities += 1;
-                    log_opportunity(&opportunity, scan_id, run_context);
+                    log_opportunity(&opportunity, scan_id, run_context, found.book_age_ms);
                 }
                 if let Some(overheat) = found.overheat {
-                    log_overheat(&overheat, scan_id, run_context);
+                    log_overheat(&overheat, scan_id, run_context, found.book_age_ms);
                     overheat_tracker.record(&overheat, now);
                 }
             }
@@ -334,39 +335,42 @@ async fn process_market_from_cache(
     market: polymarket::Market,
     max_quote_age: Duration,
 ) -> Result<MarketScanResult> {
-    if market.outcomes.len() < config.min_outcomes || market.outcomes.len() > config.max_outcomes {
-        return Ok(MarketScanResult {
-            opportunities: Vec::new(),
-            overheat: None,
-        });
-    }
-    if market.outcomes.is_empty() {
-        return Ok(MarketScanResult {
-            opportunities: Vec::new(),
-            overheat: None,
-        });
-    }
+    let (yes, no, _) = match select_binary_outcomes(&market, config) {
+        Some(outcomes) => outcomes,
+        None => {
+            return Ok(MarketScanResult {
+                opportunities: Vec::new(),
+                overheat: None,
+                book_age_ms: None,
+            })
+        }
+    };
+    let outcomes = vec![yes, no];
 
-    let enforce_staleness = max_quote_age.as_secs() > 0;
-    let mut books = Vec::with_capacity(market.outcomes.len());
-    let snapshot = cache.read().await;
-    for outcome in &market.outcomes {
+    let enforce_staleness = config.require_orderbook && max_quote_age.as_secs() > 0;
+    let mut books = Vec::with_capacity(outcomes.len());
+    let mut max_age_ms: Option<u64> = None;
+    for outcome in &outcomes {
         if outcome.token_id.trim().is_empty() {
             debug!("missing token id for market {}", market.id);
             return Ok(MarketScanResult {
                 opportunities: Vec::new(),
                 overheat: None,
+                book_age_ms: None,
             });
         }
 
-        if let Some(state) = snapshot.get(&outcome.token_id) {
+        if let Some(state) = cache.get(&outcome.token_id) {
             if enforce_staleness && state.updated_at.elapsed() > max_quote_age {
                 debug!("stale quote for token {}", outcome.token_id);
                 return Ok(MarketScanResult {
                     opportunities: Vec::new(),
                     overheat: None,
+                    book_age_ms: None,
                 });
             }
+            let age_ms = state.updated_at.elapsed().as_millis() as u64;
+            max_age_ms = Some(max_age_ms.map_or(age_ms, |current| current.max(age_ms)));
             books.push(OutcomeBook {
                 name: outcome.name.clone(),
                 token_id: outcome.token_id.clone(),
@@ -380,33 +384,46 @@ async fn process_market_from_cache(
         return Ok(MarketScanResult {
             opportunities: Vec::new(),
             overheat: None,
+            book_age_ms: None,
         });
     }
 
-    drop(snapshot);
     Ok(MarketScanResult {
         opportunities: evaluate_market(&market, &books, config),
         overheat: evaluate_overheat(&market, &books, config),
+        book_age_ms: max_age_ms,
     })
 }
 
 fn collect_token_ids(
     markets: &[polymarket::Market],
     config: &config::ArbitrageConfig,
+    scan_id: u64,
 ) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut tokens = Vec::new();
     for market in markets {
-        if market.outcomes.len() < config.min_outcomes || market.outcomes.len() > config.max_outcomes
-        {
-            continue;
+        let (yes, no, fallback) = match select_binary_outcomes(market, config) {
+            Some(outcomes) => outcomes,
+            None => continue,
+        };
+        if fallback {
+            warn!(
+                event = "binary_mapping_fallback",
+                scan_id,
+                market_id = %market.id,
+                yes_name = %yes.name,
+                no_name = %no.name,
+                yes_token_id = %yes.token_id,
+                no_token_id = %no.token_id
+            );
         }
-        for outcome in &market.outcomes {
+        for outcome in [yes, no] {
             if outcome.token_id.trim().is_empty() {
                 continue;
             }
             if seen.insert(outcome.token_id.clone()) {
-                tokens.push(outcome.token_id.clone());
+                tokens.push(outcome.token_id);
             }
         }
     }
@@ -418,33 +435,32 @@ async fn process_market(
     config: &config::ArbitrageConfig,
     market: polymarket::Market,
 ) -> Result<MarketScanResult> {
-    if market.outcomes.len() < config.min_outcomes || market.outcomes.len() > config.max_outcomes {
-        return Ok(MarketScanResult {
-            opportunities: Vec::new(),
-            overheat: None,
-        });
-    }
-    if market.outcomes.is_empty() {
-        return Ok(MarketScanResult {
-            opportunities: Vec::new(),
-            overheat: None,
-        });
-    }
+    let (yes, no, _) = match select_binary_outcomes(&market, config) {
+        Some(outcomes) => outcomes,
+        None => {
+            return Ok(MarketScanResult {
+                opportunities: Vec::new(),
+                overheat: None,
+                book_age_ms: None,
+            })
+        }
+    };
 
-    let mut books = Vec::with_capacity(market.outcomes.len());
-    for outcome in &market.outcomes {
+    let mut books = Vec::with_capacity(2);
+    for outcome in [yes, no] {
         if outcome.token_id.trim().is_empty() {
             debug!("missing token id for market {}", market.id);
             return Ok(MarketScanResult {
                 opportunities: Vec::new(),
                 overheat: None,
+                book_age_ms: None,
             });
         }
 
         let book = client.fetch_orderbook(&outcome.token_id).await?;
         books.push(OutcomeBook {
             name: outcome.name.clone(),
-            token_id: outcome.token_id.clone(),
+            token_id: outcome.token_id,
             asks: book.asks,
             bids: book.bids,
         });
@@ -453,5 +469,166 @@ async fn process_market(
     Ok(MarketScanResult {
         opportunities: evaluate_market(&market, &books, config),
         overheat: evaluate_overheat(&market, &books, config),
+        book_age_ms: None,
     })
+}
+
+fn log_opportunity(
+    opportunity: &arbitrage::ArbOpportunity,
+    scan_id: u64,
+    run_context: &RunContext,
+    book_age_ms: Option<u64>,
+) {
+    let side = match opportunity.side {
+        arbitrage::ArbSide::Buy => "buy",
+        arbitrage::ArbSide::Sell => "sell",
+    };
+    let edge = match opportunity.side {
+        arbitrage::ArbSide::Buy => 1.0 - opportunity.bundle_price_after_fees,
+        arbitrage::ArbSide::Sell => opportunity.bundle_price_after_fees - 1.0,
+    };
+    let edge_bps = edge * 10_000.0;
+    let legs_json = serde_json::to_string(&opportunity.legs).unwrap_or_default();
+    let depth_samples_json = serde_json::to_string(&opportunity.depth_samples).unwrap_or_default();
+    let unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let monotonic_ms = run_context.start.elapsed().as_millis() as u64;
+
+    info!(
+        event = "opportunity_detected",
+        scan_id,
+        config_hash = %run_context.config_hash,
+        market_id = %opportunity.market_id,
+        market_question = %opportunity.market_question,
+        market_slug = opportunity.market_slug.as_deref().unwrap_or(""),
+        side,
+        size = opportunity.size,
+        probe_size = opportunity.probe_size,
+        probe_max_wait_ms = opportunity.probe_max_wait_ms,
+        bundle_price = opportunity.bundle_price,
+        bundle_price_after_fees = opportunity.bundle_price_after_fees,
+        total_notional = opportunity.total_notional,
+        total_after_fees = opportunity.total_after_fees,
+        profit = opportunity.profit,
+        margin = opportunity.margin,
+        margin_bps = opportunity.margin_bps,
+        edge,
+        edge_bps,
+        fee_bps = opportunity.fee_bps,
+        buffer_bps = opportunity.buffer_bps,
+        required_margin_bps = opportunity.required_margin_bps,
+        book_age_ms = book_age_ms.unwrap_or(0),
+        decision = "take",
+        depth_samples = %depth_samples_json,
+        legs = %legs_json,
+        ts_unix_ms = unix_ms,
+        monotonic_ms
+    );
+
+    info!(
+        event = "paper_orders_submitted",
+        scan_id,
+        config_hash = %run_context.config_hash,
+        side,
+        size = opportunity.size,
+        probe_size = opportunity.probe_size,
+        legs = %legs_json,
+        submit_latency_ms = 0u64,
+        decision_latency_ms = 0u64,
+        ts_unix_ms = unix_ms,
+        monotonic_ms
+    );
+
+    let roi = if opportunity.total_notional > 0.0 {
+        opportunity.profit / opportunity.total_notional
+    } else {
+        0.0
+    };
+    info!(
+        event = "opp_closed",
+        scan_id,
+        config_hash = %run_context.config_hash,
+        status = "paper_only",
+        realized_pnl_usd = opportunity.profit,
+        capital_locked_usd = opportunity.total_notional,
+        lock_duration_s = 0u64,
+        roi,
+        ts_unix_ms = unix_ms,
+        monotonic_ms
+    );
+}
+
+fn log_overheat(
+    signal: &OverheatSignal,
+    scan_id: u64,
+    run_context: &RunContext,
+    book_age_ms: Option<u64>,
+) {
+    let legs_json = serde_json::to_string(&signal.legs).unwrap_or_default();
+    let unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let monotonic_ms = run_context.start.elapsed().as_millis() as u64;
+
+    info!(
+        event = "overheat_detected",
+        scan_id,
+        config_hash = %run_context.config_hash,
+        market_id = %signal.market_id,
+        market_question = %signal.market_question,
+        market_slug = signal.market_slug.as_deref().unwrap_or(""),
+        bid_sum = signal.bid_sum,
+        excess = signal.excess,
+        min_size = signal.min_size,
+        book_age_ms = book_age_ms.unwrap_or(0),
+        legs = %legs_json,
+        ts_unix_ms = unix_ms,
+        monotonic_ms
+    );
+}
+
+fn select_binary_outcomes(
+    market: &polymarket::Market,
+    config: &config::ArbitrageConfig,
+) -> Option<(polymarket::Outcome, polymarket::Outcome, bool)> {
+    if market.outcomes.len() < config.min_outcomes || market.outcomes.len() > config.max_outcomes {
+        return None;
+    }
+    if market.outcomes.len() != 2 {
+        return None;
+    }
+
+    let mut yes_idx = None;
+    let mut no_idx = None;
+    for (idx, outcome) in market.outcomes.iter().enumerate() {
+        let name = normalize_outcome_name(&outcome.name);
+        if name == "yes" {
+            yes_idx = Some(idx);
+        } else if name == "no" {
+            no_idx = Some(idx);
+        }
+    }
+
+    if let (Some(yes), Some(no)) = (yes_idx, no_idx) {
+        if yes != no {
+            return Some((
+                market.outcomes[yes].clone(),
+                market.outcomes[no].clone(),
+                false,
+            ));
+        }
+    }
+
+    Some((
+        market.outcomes[0].clone(),
+        market.outcomes[1].clone(),
+        true,
+    ))
+}
+
+fn normalize_outcome_name(name: &str) -> String {
+    name.trim().to_lowercase()
 }

@@ -369,6 +369,70 @@ pub(crate) fn extract_orderbook_update(value: &Value) -> Option<OrderbookUpdate>
     Some(OrderbookUpdate { asks, bids })
 }
 
+pub(crate) fn extract_ws_asset_id(value: &Value) -> Option<String> {
+    first_string(
+        value,
+        &[
+            "asset_id",
+            "assetId",
+            "clobTokenId",
+            "clob_token_id",
+            "data.asset_id",
+            "data.assetId",
+            "data.clobTokenId",
+            "data.clob_token_id",
+        ],
+    )
+}
+
+pub(crate) fn extract_ws_message_type(value: &Value) -> Option<String> {
+    first_string(
+        value,
+        &[
+            "type",
+            "data.type",
+            "event_type",
+            "data.event_type",
+            "channel",
+            "data.channel",
+        ],
+    )
+}
+
+pub(crate) fn extract_ws_seq(value: &Value) -> Option<u64> {
+    first_u64(
+        value,
+        &[
+            "seq",
+            "sequence",
+            "sequence_id",
+            "sequenceId",
+            "sequenceNumber",
+            "seqNum",
+            "data.seq",
+            "data.sequence",
+            "data.sequence_id",
+            "data.sequenceId",
+        ],
+    )
+}
+
+pub(crate) fn extract_ws_prev_seq(value: &Value) -> Option<u64> {
+    first_u64(
+        value,
+        &[
+            "prev_seq",
+            "prevSeq",
+            "previous_sequence",
+            "previousSequence",
+            "data.prev_seq",
+            "data.prevSeq",
+            "data.previous_sequence",
+            "data.previousSequence",
+        ],
+    )
+}
+
 pub(crate) fn extract_orderbook(value: &Value) -> Option<Orderbook> {
     let update = extract_orderbook_update(value)?;
     let asks = update.asks.unwrap_or_default();
