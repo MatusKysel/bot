@@ -695,19 +695,21 @@ fn parse_ws_event(
     expected_type: &str,
 ) -> Option<WsBookEvent> {
     let msg_type = extract_ws_message_type(value)
-        .or_else(|| root_type.map(|value| value.to_string()))?;
-    if !expected_type.is_empty() && !msg_type.eq_ignore_ascii_case(expected_type) {
-        let mut matched = false;
-        if let Some(channel) = find_string(value, &["channel", "data.channel"]) {
-            if channel.eq_ignore_ascii_case(expected_type) {
+        .or_else(|| root_type.map(|value| value.to_string()));
+    if let Some(msg_type) = msg_type.as_deref() {
+        if !expected_type.is_empty() && !msg_type.eq_ignore_ascii_case(expected_type) {
+            let mut matched = false;
+            if let Some(channel) = find_string(value, &["channel", "data.channel"]) {
+                if channel.eq_ignore_ascii_case(expected_type) {
+                    matched = true;
+                }
+            }
+            if !matched && expected_type.eq_ignore_ascii_case("MARKET") && is_orderbook_type(msg_type) {
                 matched = true;
             }
-        }
-        if !matched && expected_type.eq_ignore_ascii_case("MARKET") && is_orderbook_type(&msg_type) {
-            matched = true;
-        }
-        if !matched {
-            return None;
+            if !matched {
+                return None;
+            }
         }
     }
 

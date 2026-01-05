@@ -407,10 +407,14 @@ pub(crate) fn extract_ws_asset_id(value: &Value) -> Option<String> {
             "assetId",
             "clobTokenId",
             "clob_token_id",
+            "token_id",
+            "tokenId",
             "data.asset_id",
             "data.assetId",
             "data.clobTokenId",
             "data.clob_token_id",
+            "data.token_id",
+            "data.tokenId",
         ],
     )
 }
