@@ -1,7 +1,7 @@
 use crate::config::ArbitrageConfig;
 use crate::polymarket::{Market, PriceLevel};
+use crate::price_utils::{cmp_asc, cmp_desc};
 use serde::Serialize;
-use std::cmp::Ordering;
 
 #[derive(Debug, Clone)]
 pub struct OutcomeBook {
@@ -11,7 +11,6 @@ pub struct OutcomeBook {
     pub bids: Vec<PriceLevel>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub enum ArbSide {
     Buy,
@@ -362,16 +361,8 @@ fn sanitize_levels(
         .collect();
 
     match side {
-        ArbSide::Buy => filtered.sort_by(|a, b| {
-            a.price
-                .partial_cmp(&b.price)
-                .unwrap_or(Ordering::Equal)
-        }),
-        ArbSide::Sell => filtered.sort_by(|a, b| {
-            b.price
-                .partial_cmp(&a.price)
-                .unwrap_or(Ordering::Equal)
-        }),
+        ArbSide::Buy => filtered.sort_by(|a, b| cmp_asc(a.price, b.price)),
+        ArbSide::Sell => filtered.sort_by(|a, b| cmp_desc(a.price, b.price)),
     }
 
     filtered
@@ -474,7 +465,7 @@ fn candidate_sizes(
         }
     }
 
-    sizes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
+    sizes.sort_by(|a, b| a.total_cmp(b));
     sizes.dedup_by(|a, b| (*a - *b).abs() <= 1e-9);
     sizes
         .into_iter()

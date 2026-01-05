@@ -27,6 +27,7 @@ pub struct Market {
     pub slug: Option<String>,
     pub category: Option<String>,
     pub subcategory: Option<String>,
+    pub restricted: Option<bool>,
     pub outcomes: Vec<Outcome>,
     pub outcome_prices: Vec<f64>,
     pub volume: Option<f64>,
@@ -168,6 +169,7 @@ impl Market {
         let slug = first_string(value, &["slug", "market_slug", "marketSlug"]);
         let category = first_string(value, &["category", "primaryCategory"]);
         let subcategory = first_string(value, &["subCategory", "subcategory"]);
+        let restricted = first_bool(value, &["restricted", "isRestricted", "is_restricted"]);
 
         let outcomes = extract_outcomes(value);
         let outcome_prices = extract_outcome_prices(value);
@@ -233,6 +235,7 @@ impl Market {
             slug,
             category,
             subcategory,
+            restricted,
             outcomes,
             outcome_prices,
             volume,
@@ -250,7 +253,7 @@ impl Market {
         }
         let category_match = match self.category.as_deref() {
             Some(value) => contains_ignore_case(value, category),
-            None => true,
+            None => false,
         };
 
         let subcategory_match = match (subcategory, &self.subcategory) {
@@ -260,6 +263,33 @@ impl Market {
         };
 
         category_match && subcategory_match
+    }
+
+    pub fn matches_category_or_keywords(
+        &self,
+        category: &str,
+        subcategory: Option<&str>,
+        keywords: &[String],
+    ) -> bool {
+        let category = category.trim();
+        if category.is_empty() {
+            return matches_keywords(
+                &self.question,
+                self.slug.as_deref().unwrap_or(""),
+                keywords,
+            );
+        }
+        if self.matches_category(category, subcategory) {
+            return true;
+        }
+        if self.category.is_some() {
+            return false;
+        }
+        matches_keywords(
+            &self.question,
+            self.slug.as_deref().unwrap_or(""),
+            keywords,
+        )
     }
 }
 
@@ -362,11 +392,11 @@ pub(crate) fn extract_orderbook_update(value: &Value) -> Option<OrderbookUpdate>
         ],
     );
 
-    if asks.is_none() && bids.is_none() {
-        return None;
+    if asks.is_some() || bids.is_some() {
+        return Some(OrderbookUpdate { asks, bids });
     }
 
-    Some(OrderbookUpdate { asks, bids })
+    extract_changes_update(value)
 }
 
 pub(crate) fn extract_ws_asset_id(value: &Value) -> Option<String> {
@@ -391,6 +421,8 @@ pub(crate) fn extract_ws_message_type(value: &Value) -> Option<String> {
         &[
             "type",
             "data.type",
+            "event",
+            "data.event",
             "event_type",
             "data.event_type",
             "channel",
@@ -409,10 +441,15 @@ pub(crate) fn extract_ws_seq(value: &Value) -> Option<u64> {
             "sequenceId",
             "sequenceNumber",
             "seqNum",
+            "last_seq",
+            "lastSeq",
             "data.seq",
             "data.sequence",
             "data.sequence_id",
             "data.sequenceId",
+            "data.sequenceNumber",
+            "data.last_seq",
+            "data.lastSeq",
         ],
     )
 }
@@ -425,10 +462,16 @@ pub(crate) fn extract_ws_prev_seq(value: &Value) -> Option<u64> {
             "prevSeq",
             "previous_sequence",
             "previousSequence",
+            "prev_sequence_id",
+            "prevSequenceId",
+            "prevSeqNum",
             "data.prev_seq",
             "data.prevSeq",
             "data.previous_sequence",
             "data.previousSequence",
+            "data.prev_sequence_id",
+            "data.prevSequenceId",
+            "data.prevSeqNum",
         ],
     )
 }
@@ -452,6 +495,82 @@ fn extract_levels(value: &Value, keys: &[&str]) -> Option<Vec<PriceLevel>> {
         }
     }
     Some(levels)
+}
+
+fn extract_changes_update(value: &Value) -> Option<OrderbookUpdate> {
+    let items = find_array(
+        value,
+        &[
+            "changes",
+            "data.changes",
+            "data.book.changes",
+            "data.orderbook.changes",
+            "book.changes",
+            "orderbook.changes",
+            "payload.changes",
+        ],
+    )?;
+    let mut asks = Vec::new();
+    let mut bids = Vec::new();
+    for item in items {
+        if let Some((is_bid, level)) = parse_change(item) {
+            if is_bid {
+                bids.push(level);
+            } else {
+                asks.push(level);
+            }
+        }
+    }
+    if asks.is_empty() && bids.is_empty() {
+        return None;
+    }
+    Some(OrderbookUpdate {
+        asks: if asks.is_empty() { None } else { Some(asks) },
+        bids: if bids.is_empty() { None } else { Some(bids) },
+    })
+}
+
+fn parse_change(value: &Value) -> Option<(bool, PriceLevel)> {
+    match value {
+        Value::Array(values) => {
+            if values.len() < 3 {
+                return None;
+            }
+            let side = values.get(0).and_then(Value::as_str)?;
+            let price = parse_number(values.get(1)?)?;
+            let size = parse_number(values.get(2)?);
+            let is_bid = parse_side(side)?;
+            Some((is_bid, PriceLevel { price, size }))
+        }
+        Value::Object(map) => {
+            let side = map
+                .get("side")
+                .or_else(|| map.get("type"))
+                .or_else(|| map.get("action"))
+                .and_then(Value::as_str)?;
+            let price = map
+                .get("price")
+                .or_else(|| map.get("p"))
+                .and_then(parse_number)?;
+            let size = map
+                .get("size")
+                .or_else(|| map.get("s"))
+                .or_else(|| map.get("quantity"))
+                .and_then(parse_number);
+            let is_bid = parse_side(side)?;
+            Some((is_bid, PriceLevel { price, size }))
+        }
+        _ => None,
+    }
+}
+
+fn parse_side(value: &str) -> Option<bool> {
+    let side = value.trim().to_lowercase();
+    match side.as_str() {
+        "bid" | "buy" | "b" => Some(true),
+        "ask" | "sell" | "s" => Some(false),
+        _ => None,
+    }
 }
 
 fn parse_level(value: &Value) -> Option<PriceLevel> {
@@ -490,37 +609,79 @@ fn extract_array<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a Vec<Value>> 
 }
 
 fn extract_string_array(value: &Value, keys: &[&str]) -> Option<Vec<String>> {
-    let items = extract_array(value, keys)?;
-    let mut results = Vec::with_capacity(items.len());
-    for item in items {
-        if let Some(text) = item.as_str() {
-            results.push(text.to_string());
-        } else if let Some(number) = item.as_i64() {
-            results.push(number.to_string());
-        } else if let Some(number) = item.as_u64() {
-            results.push(number.to_string());
+    for key in keys {
+        if let Some(found) = find_value(value, key) {
+            if let Some(items) = found.as_array() {
+                let mut results = Vec::with_capacity(items.len());
+                for item in items {
+                    if let Some(text) = item.as_str() {
+                        results.push(text.to_string());
+                    } else if let Some(number) = item.as_i64() {
+                        results.push(number.to_string());
+                    } else if let Some(number) = item.as_u64() {
+                        results.push(number.to_string());
+                    }
+                }
+                if !results.is_empty() {
+                    return Some(results);
+                }
+            } else if let Some(text) = found.as_str() {
+                let trimmed = text.trim();
+                if trimmed.starts_with('[') {
+                    if let Ok(items) = serde_json::from_str::<Vec<Value>>(trimmed) {
+                        let mut results = Vec::with_capacity(items.len());
+                        for item in items {
+                            if let Some(text) = item.as_str() {
+                                results.push(text.to_string());
+                            } else if let Some(number) = item.as_i64() {
+                                results.push(number.to_string());
+                            } else if let Some(number) = item.as_u64() {
+                                results.push(number.to_string());
+                            }
+                        }
+                        if !results.is_empty() {
+                            return Some(results);
+                        }
+                    }
+                }
+            }
         }
     }
-    if results.is_empty() {
-        None
-    } else {
-        Some(results)
-    }
+    None
 }
 
 fn extract_number_array(value: &Value, keys: &[&str]) -> Option<Vec<f64>> {
-    let items = extract_array(value, keys)?;
-    let mut results = Vec::with_capacity(items.len());
-    for item in items {
-        if let Some(number) = parse_number(item) {
-            results.push(number);
+    for key in keys {
+        if let Some(found) = find_value(value, key) {
+            if let Some(items) = found.as_array() {
+                let mut results = Vec::with_capacity(items.len());
+                for item in items {
+                    if let Some(number) = parse_number(item) {
+                        results.push(number);
+                    }
+                }
+                if !results.is_empty() {
+                    return Some(results);
+                }
+            } else if let Some(text) = found.as_str() {
+                let trimmed = text.trim();
+                if trimmed.starts_with('[') {
+                    if let Ok(items) = serde_json::from_str::<Vec<Value>>(trimmed) {
+                        let mut results = Vec::with_capacity(items.len());
+                        for item in items {
+                            if let Some(number) = parse_number(&item) {
+                                results.push(number);
+                            }
+                        }
+                        if !results.is_empty() {
+                            return Some(results);
+                        }
+                    }
+                }
+            }
         }
     }
-    if results.is_empty() {
-        None
-    } else {
-        Some(results)
-    }
+    None
 }
 
 pub(crate) fn extract_token_id(value: &Value) -> Option<String> {
@@ -583,6 +744,26 @@ fn first_number(value: &Value, keys: &[&str]) -> Option<f64> {
     None
 }
 
+fn first_bool(value: &Value, keys: &[&str]) -> Option<bool> {
+    for key in keys {
+        if let Some(found) = find_value(value, key) {
+            if let Some(flag) = found.as_bool() {
+                return Some(flag);
+            }
+            if let Some(text) = found.as_str() {
+                let normalized = text.trim().to_lowercase();
+                if normalized == "true" {
+                    return Some(true);
+                }
+                if normalized == "false" {
+                    return Some(false);
+                }
+            }
+        }
+    }
+    None
+}
+
 fn first_u64(value: &Value, keys: &[&str]) -> Option<u64> {
     for key in keys {
         if let Some(found) = find_value(value, key) {
@@ -637,6 +818,40 @@ fn find_value<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
 
 fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
     haystack.to_lowercase().contains(&needle.to_lowercase())
+}
+
+fn contains_keyword_match(haystack: &str, needle: &str) -> bool {
+    let trimmed = needle.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let needle_lower = trimmed.to_lowercase();
+    let hay_lower = haystack.to_lowercase();
+    if needle_lower.len() <= 3 {
+        for token in hay_lower.split(|c: char| !c.is_alphanumeric()) {
+            if token == needle_lower {
+                return true;
+            }
+        }
+        return false;
+    }
+    hay_lower.contains(&needle_lower)
+}
+
+fn contains_any_ignore_case(haystack: &str, needles: &[String]) -> bool {
+    for needle in needles {
+        if contains_keyword_match(haystack, needle) {
+            return true;
+        }
+    }
+    false
+}
+
+fn matches_keywords(question: &str, slug: &str, keywords: &[String]) -> bool {
+    if keywords.is_empty() {
+        return false;
+    }
+    contains_any_ignore_case(question, keywords) || contains_any_ignore_case(slug, keywords)
 }
 
 fn format_end_date(hours: i64) -> Option<String> {

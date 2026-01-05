@@ -3,6 +3,7 @@ use crate::polymarket::{
     extract_orderbook_update, extract_ws_asset_id, extract_ws_message_type, extract_ws_prev_seq,
     extract_ws_seq, Orderbook, OrderbookUpdate, PolymarketClient, PriceLevel,
 };
+use crate::price_utils;
 use anyhow::{Context, Result};
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
@@ -16,6 +17,10 @@ use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::time::Duration;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
+
+static UNHANDLED_WS_LOGS: AtomicU64 = AtomicU64::new(0);
+static SUBSCRIBE_PAYLOAD_LOGS: AtomicU64 = AtomicU64::new(0);
+static WS_MESSAGE_LOGS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 pub struct BookState {
@@ -32,6 +37,16 @@ pub struct BookState {
 }
 
 pub type OrderbookCache = Arc<DashMap<String, BookState>>;
+
+pub fn insert_snapshot(cache: &OrderbookCache, token_id: &str, mut book: Orderbook) {
+    let now = Instant::now();
+    book.asks = normalize_levels(book.asks, true);
+    book.bids = normalize_levels(book.bids, false);
+    let mut state = init_book_state(book, now);
+    state.has_snapshot = true;
+    state.updated_at = now;
+    cache.insert(token_id.to_string(), state);
+}
 
 pub struct WsOrderbookHandle {
     cache: OrderbookCache,
@@ -104,7 +119,6 @@ impl WsOrderbookHandle {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub async fn unsubscribe_tokens(&self, tokens: Vec<String>) -> Result<()> {
         let mut removed = Vec::new();
         {
@@ -200,7 +214,12 @@ async fn ws_task(
                         maybe_cmd = cmd_rx.recv() => {
                             match maybe_cmd {
                                 Some(WsCommand::Subscribe(tokens)) => {
-                                    if let Err(err) = send_asset_updates(&config, &mut write, tokens, Some(&config.ws_subscribe_operation)).await {
+                                    let operation = if config.ws_use_operation_on_connect {
+                                        Some(config.ws_subscribe_operation.as_str())
+                                    } else {
+                                        None
+                                    };
+                                    if let Err(err) = send_asset_updates(&config, &mut write, tokens, operation).await {
                                         warn!("ws subscribe failed: {:#}", err);
                                     }
                                 }
@@ -220,6 +239,10 @@ async fn ws_task(
                                 Some(Ok(message)) => {
                                     match message {
                                         Message::Text(text) => {
+                                            let count = WS_MESSAGE_LOGS.fetch_add(1, Ordering::Relaxed);
+                                            if count < 3 {
+                                                info!(event = "ws_message_received", byte_len = text.len());
+                                            }
                                             if update_tx.try_send(text).is_err() {
                                                 dropped_updates += 1;
                                                 stats.dropped_updates.fetch_add(1, Ordering::Relaxed);
@@ -230,6 +253,10 @@ async fn ws_task(
                                         }
                                         Message::Binary(bytes) => {
                                             if let Ok(text) = String::from_utf8(bytes) {
+                                                let count = WS_MESSAGE_LOGS.fetch_add(1, Ordering::Relaxed);
+                                                if count < 3 {
+                                                    info!(event = "ws_message_received", byte_len = text.len());
+                                                }
                                                 if update_tx.try_send(text).is_err() {
                                                     dropped_updates += 1;
                                                     stats.dropped_updates.fetch_add(1, Ordering::Relaxed);
@@ -328,6 +355,11 @@ where
             .send(message)
             .await
             .map_err(|err| anyhow::anyhow!("send ws message: {err}"))?;
+        info!(
+            event = "ws_subscription_sent",
+            operation = operation.unwrap_or("none"),
+            asset_count = chunk.len()
+        );
         if config.ws_subscribe_delay_ms > 0 {
             tokio::time::sleep(delay).await;
         }
@@ -362,6 +394,10 @@ fn build_asset_message(
     }
 
     let text = Value::Object(payload).to_string();
+    let count = SUBSCRIBE_PAYLOAD_LOGS.fetch_add(1, Ordering::Relaxed);
+    if count < 3 {
+        info!(event = "ws_subscription_payload", payload = %text);
+    }
     Ok(Message::Text(text))
 }
 
@@ -491,7 +527,10 @@ async fn handle_ws_value(
 ) {
     let event = match parse_ws_event(value, root_type, &config.ws_message_type) {
         Some(event) => event,
-        None => return,
+        None => {
+            maybe_log_unhandled_ws(value, root_type, &config.ws_message_type);
+            return;
+        }
     };
 
     let mut resync_reason = None;
@@ -506,22 +545,51 @@ async fn handle_ws_value(
             entry.book.asks = normalize_levels(event.update.asks.unwrap_or_default(), true);
             entry.book.bids = normalize_levels(event.update.bids.unwrap_or_default(), false);
             entry.updated_at = now;
-            entry.last_seq = event.seq;
+            entry.last_seq = event.seq.or(event.prev_seq);
             entry.has_snapshot = true;
             update_churn_stats(&mut entry, now);
         } else {
             if !entry.has_snapshot {
                 resync_reason = Some("delta_without_snapshot");
-            } else if event.seq.is_none() {
-                resync_reason = Some("delta_without_seq");
-            } else if let Some(seq) = event.seq {
-                if let Some(last_seq) = entry.last_seq {
+            }
+
+            if resync_reason.is_none() {
+                if let (Some(seq), Some(last_seq)) = (event.seq, entry.last_seq) {
                     if seq <= last_seq {
                         return;
                     }
-                    if seq != last_seq + 1 {
-                        resync_reason = Some("seq_gap");
+                }
+            }
+
+            if resync_reason.is_none() {
+                if let Some(prev_seq) = event.prev_seq {
+                    if let Some(last_seq) = entry.last_seq {
+                        if prev_seq != last_seq {
+                            resync_reason = Some("prev_seq_mismatch");
+                        }
+                    } else {
+                        resync_reason = Some("prev_seq_without_snapshot");
                     }
+                }
+            }
+
+            if resync_reason.is_none() {
+                if let (Some(seq), Some(prev_seq)) = (event.seq, event.prev_seq) {
+                    if seq != prev_seq.saturating_add(1) {
+                        resync_reason = Some("seq_prev_mismatch");
+                    }
+                }
+            }
+
+            if resync_reason.is_none() {
+                if let Some(seq) = event.seq {
+                    if let Some(last_seq) = entry.last_seq {
+                        if seq != last_seq + 1 {
+                            resync_reason = Some("seq_gap");
+                        }
+                    }
+                } else if event.prev_seq.is_none() {
+                    resync_reason = Some("delta_without_seq");
                 }
             }
 
@@ -533,7 +601,10 @@ async fn handle_ws_value(
                     apply_delta_levels(&mut entry.book.bids, &bids, false);
                 }
                 entry.updated_at = now;
-                entry.last_seq = event.seq.or(entry.last_seq);
+                entry.last_seq = event
+                    .seq
+                    .or_else(|| event.prev_seq.map(|prev| prev.saturating_add(1)))
+                    .or(entry.last_seq);
                 update_churn_stats(&mut entry, now);
             } else {
                 entry.has_snapshot = false;
@@ -614,6 +685,7 @@ struct WsBookEvent {
     token_id: String,
     update: OrderbookUpdate,
     seq: Option<u64>,
+    prev_seq: Option<u64>,
     is_snapshot: bool,
 }
 
@@ -624,8 +696,19 @@ fn parse_ws_event(
 ) -> Option<WsBookEvent> {
     let msg_type = extract_ws_message_type(value)
         .or_else(|| root_type.map(|value| value.to_string()))?;
-    if !msg_type.eq_ignore_ascii_case(expected_type) {
-        return None;
+    if !expected_type.is_empty() && !msg_type.eq_ignore_ascii_case(expected_type) {
+        let mut matched = false;
+        if let Some(channel) = find_string(value, &["channel", "data.channel"]) {
+            if channel.eq_ignore_ascii_case(expected_type) {
+                matched = true;
+            }
+        }
+        if !matched && expected_type.eq_ignore_ascii_case("MARKET") && is_orderbook_type(&msg_type) {
+            matched = true;
+        }
+        if !matched {
+            return None;
+        }
     }
 
     let token_id = extract_ws_asset_id(value)?;
@@ -651,8 +734,38 @@ fn parse_ws_event(
         token_id,
         update,
         seq,
+        prev_seq,
         is_snapshot,
     })
+}
+
+fn maybe_log_unhandled_ws(value: &Value, root_type: Option<&str>, expected_type: &str) {
+    let count = UNHANDLED_WS_LOGS.fetch_add(1, Ordering::Relaxed);
+    if count >= 5 {
+        return;
+    }
+    let msg_type = extract_ws_message_type(value).or_else(|| root_type.map(|value| value.to_string()));
+    let channel = find_string(value, &["channel", "data.channel"]);
+    let asset_id = extract_ws_asset_id(value);
+    let update = extract_orderbook_update(value);
+    let has_asks = update.as_ref().map(|u| u.asks.is_some()).unwrap_or(false);
+    let has_bids = update.as_ref().map(|u| u.bids.is_some()).unwrap_or(false);
+    let top_keys = collect_keys(value, 10);
+    let data_keys = value
+        .get("data")
+        .map(|data| collect_keys(data, 10))
+        .unwrap_or_default();
+    warn!(
+        event = "ws_message_unhandled",
+        expected_type = expected_type,
+        msg_type = msg_type.unwrap_or_default(),
+        channel = channel.unwrap_or_default(),
+        asset_id = asset_id.unwrap_or_default(),
+        has_asks,
+        has_bids,
+        top_keys = ?top_keys,
+        data_keys = ?data_keys
+    );
 }
 
 fn infer_snapshot(value: &Value, update: &OrderbookUpdate) -> bool {
@@ -661,8 +774,12 @@ fn infer_snapshot(value: &Value, update: &OrderbookUpdate) -> bool {
     }
     if let Some(kind) = find_string(value, &["event", "event_type", "action", "message_type"]) {
         let kind = kind.to_lowercase();
-        if kind.contains("snapshot") || kind.contains("book") {
+        let is_update = kind.contains("update") || kind.contains("delta") || kind.contains("l2");
+        if kind.contains("snapshot") {
             return true;
+        }
+        if kind.contains("book") && !is_update {
+            return update.asks.is_some() && update.bids.is_some();
         }
     }
     update.asks.is_some() && update.bids.is_some()
@@ -681,6 +798,11 @@ fn infer_delta(value: &Value, update: &OrderbookUpdate, has_prev_seq: bool) -> b
     update.asks.is_some() ^ update.bids.is_some()
 }
 
+fn is_orderbook_type(msg_type: &str) -> bool {
+    let kind = msg_type.to_lowercase();
+    kind.contains("book") || kind.contains("orderbook") || kind.contains("l2")
+}
+
 fn normalize_levels(levels: Vec<PriceLevel>, is_ask: bool) -> Vec<PriceLevel> {
     let mut filtered: Vec<PriceLevel> = levels
         .into_iter()
@@ -696,9 +818,7 @@ fn normalize_levels(levels: Vec<PriceLevel>, is_ask: bool) -> Vec<PriceLevel> {
         })
         .collect();
 
-    filtered.sort_by(|a, b| {
-        cmp_price(a.price, b.price, is_ask)
-    });
+    filtered.sort_by(|a, b| price_utils::cmp_price(a.price, b.price, is_ask));
     filtered
 }
 
@@ -714,7 +834,9 @@ fn apply_delta_levels(levels: &mut Vec<PriceLevel>, updates: &[PriceLevel], is_a
         }
 
         let remove = size <= 0.0;
-        match levels.binary_search_by(|level| cmp_price(level.price, price, is_ask)) {
+        match levels.binary_search_by(|level| {
+            price_utils::cmp_price(level.price, price, is_ask)
+        }) {
             Ok(idx) => {
                 if remove {
                     levels.remove(idx);
@@ -734,14 +856,6 @@ fn apply_delta_levels(levels: &mut Vec<PriceLevel>, updates: &[PriceLevel], is_a
                 }
             }
         }
-    }
-}
-
-fn cmp_price(a: f64, b: f64, is_ask: bool) -> std::cmp::Ordering {
-    if is_ask {
-        a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal)
-    } else {
-        b.partial_cmp(&a).unwrap_or(std::cmp::Ordering::Equal)
     }
 }
 
@@ -773,6 +887,13 @@ fn find_value<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
         }
     }
     Some(current)
+}
+
+fn collect_keys(value: &Value, limit: usize) -> Vec<String> {
+    match value {
+        Value::Object(map) => map.keys().take(limit).cloned().collect(),
+        _ => Vec::new(),
+    }
 }
 
 fn init_book_state(book: Orderbook, now: Instant) -> BookState {

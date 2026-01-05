@@ -1,6 +1,7 @@
 mod arbitrage;
 mod config;
 mod market_selection;
+mod price_utils;
 mod polymarket;
 mod ws_orderbook;
 
@@ -11,11 +12,13 @@ use crate::polymarket::PolymarketClient;
 use crate::ws_orderbook::WsOrderbookHandle;
 use anyhow::{Context, Result};
 use clap::Parser;
+use dashmap::DashMap;
 use futures::stream::{self, StreamExt};
 use serde_json;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
@@ -31,6 +34,23 @@ struct Cli {
 static SCAN_COUNTER: AtomicU64 = AtomicU64::new(1);
 static OPP_COUNTER: AtomicU64 = AtomicU64::new(1);
 static SKIP_COUNTER: AtomicU64 = AtomicU64::new(1);
+static REST_SNAPSHOT_ATTEMPTS: OnceLock<DashMap<String, Instant>> = OnceLock::new();
+
+fn rest_snapshot_attempts() -> &'static DashMap<String, Instant> {
+    REST_SNAPSHOT_ATTEMPTS.get_or_init(DashMap::new)
+}
+
+fn should_attempt_snapshot(token_id: &str, min_interval: Duration) -> bool {
+    let now = Instant::now();
+    let attempts = rest_snapshot_attempts();
+    if let Some(last) = attempts.get(token_id) {
+        if now.duration_since(*last) < min_interval {
+            return false;
+        }
+    }
+    attempts.insert(token_id.to_string(), now);
+    true
+}
 
 struct RunContext {
     config_hash: String,
@@ -241,9 +261,10 @@ async fn run_scan(
         markets
             .into_iter()
             .filter(|market| {
-                market.matches_category(
+                market.matches_category_or_keywords(
                     &config.polymarket.market_category,
                     config.polymarket.market_subcategory.as_deref(),
+                    &config.polymarket.market_category_keywords,
                 )
             })
             .collect()
@@ -260,14 +281,62 @@ async fn run_scan(
         monotonic_ms = run_context.start.elapsed().as_millis() as u64
     );
 
+    let mut restricted_true = 0usize;
+    let mut restricted_false = 0usize;
+    let mut restricted_unknown = 0usize;
+    for market in &filtered {
+        match market.restricted {
+            Some(true) => restricted_true += 1,
+            Some(false) => restricted_false += 1,
+            None => restricted_unknown += 1,
+        }
+    }
+
+    let mut skip_restricted = config.polymarket.skip_restricted;
+    if skip_restricted && restricted_true > 0 && restricted_false == 0 {
+        skip_restricted = false;
+        warn!(
+            event = "restricted_filter_disabled",
+            scan_id,
+            restricted_true,
+            restricted_false,
+            restricted_unknown,
+            reason = "all_markets_restricted"
+        );
+    }
+
     let mut selected = Vec::new();
-    let mut skipped = 0usize;
+    let mut skipped_score = 0usize;
+    let mut skipped_nonbinary = 0usize;
+    let mut skipped_restricted = 0usize;
     for market in filtered {
+        if skip_restricted && market.restricted.unwrap_or(false) {
+            skipped_restricted += 1;
+            debug!(
+                event = "market_skipped",
+                scan_id,
+                market_id = %market.id,
+                score = 0.0,
+                reasons = "restricted"
+            );
+            continue;
+        }
+        if select_binary_outcomes(&market, &config.arbitrage).is_none() {
+            skipped_nonbinary += 1;
+            debug!(
+                event = "market_skipped",
+                scan_id,
+                market_id = %market.id,
+                score = 0.0,
+                reasons = "not_binary"
+            );
+            continue;
+        }
         let score = score_market(&market, &config.selection);
         if score.score >= config.selection.min_score {
             selected.push(market);
         } else {
-            skipped += 1;
+            skipped_score += 1;
             let reasons = if score.reasons.is_empty() {
                 "no_signals".to_string()
             } else {
@@ -287,7 +356,14 @@ async fn run_scan(
         event = "market_selection",
         scan_id,
         selected = selected.len(),
-        skipped,
+        skipped = skipped_score + skipped_nonbinary + skipped_restricted,
+        skipped_nonbinary,
+        skipped_restricted,
+        skipped_score,
+        restricted_true,
+        restricted_false,
+        restricted_unknown,
+        skip_restricted_effective = skip_restricted,
         min_score = config.selection.min_score
     );
 
@@ -313,8 +389,18 @@ async fn run_scan(
         stream::iter(selected.into_iter().map(|market| {
             let cache = cache.clone();
             let arb_config = config.arbitrage.clone();
+            let pm_config = config.polymarket.clone();
+            let client = client.clone();
             async move {
-                process_market_from_cache(&cache, &arb_config, market, max_quote_age).await
+                process_market_from_cache(
+                    &client,
+                    &cache,
+                    &arb_config,
+                    &pm_config,
+                    market,
+                    max_quote_age,
+                )
+                .await
             }
         }))
         .buffer_unordered(max_concurrency)
@@ -423,12 +509,14 @@ async fn run_scan(
 }
 
 async fn process_market_from_cache(
+    client: &PolymarketClient,
     cache: &ws_orderbook::OrderbookCache,
-    config: &config::ArbitrageConfig,
+    arb_config: &config::ArbitrageConfig,
+    pm_config: &config::PolymarketConfig,
     market: polymarket::Market,
     max_quote_age: Duration,
 ) -> Result<MarketScanResult> {
-    let selected = match select_binary_outcomes(&market, config) {
+    let selected = match select_binary_outcomes(&market, arb_config) {
         Some(outcomes) => outcomes,
         None => {
             return Ok(MarketScanResult {
@@ -447,15 +535,16 @@ async fn process_market_from_cache(
             })
         }
     };
-    let outcomes = vec![selected.yes.clone(), selected.no.clone()];
-
-    let enforce_staleness = config.require_orderbook && max_quote_age.as_secs() > 0;
+    let enforce_staleness = arb_config.require_orderbook && max_quote_age.as_secs() > 0;
+    let rest_snapshot_min_interval =
+        Duration::from_secs(pm_config.rest_snapshot_min_interval_secs.max(1));
+    let outcomes = [&selected.yes, &selected.no];
     let mut books = Vec::with_capacity(outcomes.len());
     let mut max_age_ms: Option<u64> = None;
     let mut updates_per_sec: Option<f64> = None;
     let mut best_ask_flips_per_sec: Option<f64> = None;
     let mut best_bid_flips_per_sec: Option<f64> = None;
-    for outcome in &outcomes {
+    for outcome in outcomes {
         if outcome.token_id.trim().is_empty() {
             debug!("missing token id for market {}", market.id);
             return Ok(MarketScanResult {
@@ -474,16 +563,47 @@ async fn process_market_from_cache(
             });
         }
 
+        let mut has_state = false;
+        let mut stale = false;
         if let Some(state) = cache.get(&outcome.token_id) {
-            if enforce_staleness && state.updated_at.elapsed() > max_quote_age {
-                debug!("stale quote for token {}", outcome.token_id);
+            has_state = true;
+            stale = enforce_staleness && state.updated_at.elapsed() > max_quote_age;
+        }
+
+        if (stale || !has_state) && pm_config.rest_snapshot_on_missing {
+            if should_attempt_snapshot(&outcome.token_id, rest_snapshot_min_interval) {
+                let snapshot_started = Instant::now();
+                match client.fetch_orderbook(&outcome.token_id).await {
+                    Ok(book) => {
+                        ws_orderbook::insert_snapshot(cache, &outcome.token_id, book);
+                        debug!(
+                            event = "rest_snapshot_success",
+                            token_id = %outcome.token_id,
+                            elapsed_ms = snapshot_started.elapsed().as_millis() as u64
+                        );
+                    }
+                    Err(err) => {
+                        warn!(
+                            event = "rest_snapshot_failed",
+                            token_id = %outcome.token_id,
+                            error = %err
+                        );
+                    }
+                }
+            }
+        }
+
+        let state = match cache.get(&outcome.token_id) {
+            Some(state) => state,
+            None => {
+                debug!("missing cached book for token {}", outcome.token_id);
                 return Ok(MarketScanResult {
                     market_id: market.id.clone(),
                     market_question: market.question.clone(),
                     market_slug: market.slug.clone(),
                     opportunities: Vec::new(),
                     book_age_ms: None,
-                    skip_reason: Some(SkipReason::StaleBook),
+                    skip_reason: Some(SkipReason::MissingBook),
                     best_candidate: None,
                     depth_samples: Vec::new(),
                     selected_outcomes: Some(selected.clone()),
@@ -492,49 +612,53 @@ async fn process_market_from_cache(
                     best_bid_flips_per_sec: None,
                 });
             }
-            let age_ms = state.updated_at.elapsed().as_millis() as u64;
-            max_age_ms = Some(max_age_ms.map_or(age_ms, |current| current.max(age_ms)));
-            let churn = churn_metrics_from_state(&state);
-            updates_per_sec = Some(updates_per_sec.map_or(churn.updates_per_sec, |current| {
-                current.max(churn.updates_per_sec)
-            }));
-            best_ask_flips_per_sec =
-                Some(best_ask_flips_per_sec.map_or(churn.best_ask_flips_per_sec, |current| {
-                    current.max(churn.best_ask_flips_per_sec)
-                }));
-            best_bid_flips_per_sec =
-                Some(best_bid_flips_per_sec.map_or(churn.best_bid_flips_per_sec, |current| {
-                    current.max(churn.best_bid_flips_per_sec)
-                }));
+        };
 
-            let max_levels = config.max_depth_levels;
-            books.push(OutcomeBook {
-                name: outcome.name.clone(),
-                token_id: outcome.token_id.clone(),
-                asks: truncate_levels(&state.book.asks, max_levels),
-                bids: truncate_levels(&state.book.bids, max_levels),
+        if enforce_staleness && state.updated_at.elapsed() > max_quote_age {
+            debug!("stale quote for token {}", outcome.token_id);
+            return Ok(MarketScanResult {
+                market_id: market.id.clone(),
+                market_question: market.question.clone(),
+                market_slug: market.slug.clone(),
+                opportunities: Vec::new(),
+                book_age_ms: None,
+                skip_reason: Some(SkipReason::StaleBook),
+                best_candidate: None,
+                depth_samples: Vec::new(),
+                selected_outcomes: Some(selected.clone()),
+                updates_per_sec: None,
+                best_ask_flips_per_sec: None,
+                best_bid_flips_per_sec: None,
             });
-            continue;
         }
 
-        debug!("missing cached book for token {}", outcome.token_id);
-        return Ok(MarketScanResult {
-            market_id: market.id.clone(),
-            market_question: market.question.clone(),
-            market_slug: market.slug.clone(),
-            opportunities: Vec::new(),
-            book_age_ms: None,
-            skip_reason: Some(SkipReason::MissingBook),
-            best_candidate: None,
-            depth_samples: Vec::new(),
-            selected_outcomes: Some(selected.clone()),
-            updates_per_sec: None,
-            best_ask_flips_per_sec: None,
-            best_bid_flips_per_sec: None,
+        let age_ms = state.updated_at.elapsed().as_millis() as u64;
+        max_age_ms = Some(max_age_ms.map_or(age_ms, |current| current.max(age_ms)));
+        let churn = churn_metrics_from_state(&state);
+        updates_per_sec = Some(updates_per_sec.map_or(churn.updates_per_sec, |current| {
+            current.max(churn.updates_per_sec)
+        }));
+        best_ask_flips_per_sec =
+            Some(best_ask_flips_per_sec.map_or(churn.best_ask_flips_per_sec, |current| {
+                current.max(churn.best_ask_flips_per_sec)
+            }));
+        best_bid_flips_per_sec =
+            Some(best_bid_flips_per_sec.map_or(churn.best_bid_flips_per_sec, |current| {
+                current.max(churn.best_bid_flips_per_sec)
+            }));
+
+        let max_levels = arb_config.max_depth_levels;
+        books.push(OutcomeBook {
+            name: outcome.name.clone(),
+            token_id: outcome.token_id.clone(),
+            asks: truncate_levels(&state.book.asks, max_levels),
+            bids: truncate_levels(&state.book.bids, max_levels),
         });
     }
 
-    if let Some(reason) = churn_skip_reason(config, updates_per_sec, best_ask_flips_per_sec, best_bid_flips_per_sec) {
+    if let Some(reason) =
+        churn_skip_reason(arb_config, updates_per_sec, best_ask_flips_per_sec, best_bid_flips_per_sec)
+    {
         return Ok(MarketScanResult {
             market_id: market.id.clone(),
             market_question: market.question.clone(),
@@ -551,9 +675,9 @@ async fn process_market_from_cache(
         });
     }
 
-    let evaluation = evaluate_market(&market, &books, config);
+    let evaluation = evaluate_market(&market, &books, arb_config);
     let skip_reason = if evaluation.opportunities.is_empty() {
-        determine_skip_reason(config, evaluation.best_buy_candidate.as_ref())
+        determine_skip_reason(arb_config, evaluation.best_buy_candidate.as_ref())
     } else {
         None
     };
@@ -634,7 +758,8 @@ async fn process_market(
     };
 
     let mut books = Vec::with_capacity(2);
-    for outcome in [selected.yes.clone(), selected.no.clone()] {
+    let outcomes = [&selected.yes, &selected.no];
+    for outcome in outcomes {
         if outcome.token_id.trim().is_empty() {
             debug!("missing token id for market {}", market.id);
             return Ok(MarketScanResult {
@@ -657,7 +782,7 @@ async fn process_market(
         let max_levels = config.max_depth_levels;
         books.push(OutcomeBook {
             name: outcome.name.clone(),
-            token_id: outcome.token_id,
+            token_id: outcome.token_id.clone(),
             asks: truncate_levels(&book.asks, max_levels),
             bids: truncate_levels(&book.bids, max_levels),
         });
@@ -936,14 +1061,20 @@ fn log_config_summary(config: &Config, config_hash: &str) {
     let gamma_query = serde_json::to_string(&config.polymarket.gamma_query).unwrap_or_default();
     let target_notionals =
         serde_json::to_string(&config.arbitrage.target_notionals).unwrap_or_default();
+    let category_keywords =
+        serde_json::to_string(&config.polymarket.market_category_keywords).unwrap_or_default();
     info!(
         event = "config_loaded",
         config_hash = %config_hash,
         ws_url = %config.polymarket.ws_url,
         market_category = %config.polymarket.market_category,
+        market_category_keywords = %category_keywords,
         market_limit = config.polymarket.market_limit,
+        skip_restricted = config.polymarket.skip_restricted,
         scan_interval_secs = config.polymarket.scan_interval_secs,
         max_quote_age_secs = config.polymarket.max_quote_age_secs,
+        rest_snapshot_on_missing = config.polymarket.rest_snapshot_on_missing,
+        rest_snapshot_min_interval_secs = config.polymarket.rest_snapshot_min_interval_secs,
         max_concurrent_orderbook_requests = config.polymarket.max_concurrent_orderbook_requests,
         gamma_query = %gamma_query,
         min_profit = config.arbitrage.min_profit,

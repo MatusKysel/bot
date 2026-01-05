@@ -69,12 +69,20 @@ pub struct PolymarketConfig {
     pub ws_update_queue_capacity: usize,
     #[serde(default = "default_max_quote_age_secs")]
     pub max_quote_age_secs: u64,
+    #[serde(default = "default_rest_snapshot_on_missing")]
+    pub rest_snapshot_on_missing: bool,
+    #[serde(default = "default_rest_snapshot_min_interval_secs")]
+    pub rest_snapshot_min_interval_secs: u64,
     #[serde(default = "default_market_category")]
     pub market_category: String,
+    #[serde(default)]
+    pub market_category_keywords: Vec<String>,
     #[serde(default)]
     pub market_subcategory: Option<String>,
     #[serde(default = "default_market_limit")]
     pub market_limit: usize,
+    #[serde(default = "default_skip_restricted")]
+    pub skip_restricted: bool,
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
     #[serde(default = "default_scan_interval_secs")]
@@ -217,6 +225,9 @@ impl Config {
         if self.polymarket.max_quote_age_secs == 0 && self.polymarket.use_websocket {
             return Err(anyhow!("max_quote_age_secs must be > 0 when websocket is enabled"));
         }
+        if self.polymarket.rest_snapshot_min_interval_secs == 0 {
+            return Err(anyhow!("rest_snapshot_min_interval_secs must be > 0"));
+        }
         if self.arbitrage.min_outcomes == 0 {
             return Err(anyhow!("min_outcomes must be >= 1"));
         }
@@ -293,9 +304,13 @@ impl Default for PolymarketConfig {
             ws_ping_interval_secs: default_ws_ping_interval_secs(),
             ws_update_queue_capacity: default_ws_update_queue_capacity(),
             max_quote_age_secs: default_max_quote_age_secs(),
+            rest_snapshot_on_missing: default_rest_snapshot_on_missing(),
+            rest_snapshot_min_interval_secs: default_rest_snapshot_min_interval_secs(),
             market_category: default_market_category(),
+            market_category_keywords: Vec::new(),
             market_subcategory: None,
             market_limit: default_market_limit(),
+            skip_restricted: default_skip_restricted(),
             request_timeout_secs: default_request_timeout_secs(),
             scan_interval_secs: default_scan_interval_secs(),
             max_concurrent_orderbook_requests: default_max_concurrency(),
@@ -458,12 +473,24 @@ fn default_max_quote_age_secs() -> u64 {
     5
 }
 
+fn default_rest_snapshot_on_missing() -> bool {
+    true
+}
+
+fn default_rest_snapshot_min_interval_secs() -> u64 {
+    30
+}
+
 fn default_market_category() -> String {
     "Crypto".to_string()
 }
 
 fn default_market_limit() -> usize {
     50
+}
+
+fn default_skip_restricted() -> bool {
+    false
 }
 
 fn default_request_timeout_secs() -> u64 {

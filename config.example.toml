@@ -11,7 +11,7 @@ ws_asset_ids_field = "asset_ids"
 ws_operation_field = "operation"
 ws_subscribe_operation = "subscribe"
 ws_unsubscribe_operation = "unsubscribe"
-ws_use_operation_on_connect = false
+ws_use_operation_on_connect = true
 ws_subscribe_batch_size = 25
 ws_subscribe_delay_ms = 100
 ws_reconnect_delay_secs = 5
@@ -20,11 +20,18 @@ ws_reconnect_backoff_max_ms = 30000
 ws_reconnect_jitter_ms = 250
 ws_ping_interval_secs = 20
 ws_update_queue_capacity = 2048
-max_quote_age_secs = 5
+# If WS deltas are flowing, drop this closer to 3-5s.
+max_quote_age_secs = 30
+rest_snapshot_on_missing = true
+# Minimum time between REST snapshot attempts per token.
+rest_snapshot_min_interval_secs = 30
 # Adds end_date_max=now+25h to Gamma query when set.
 gamma_end_date_max_hours = 25
 market_category = "Crypto"
-market_limit = 50
+market_category_keywords = ["bitcoin", "btc", "ethereum", "eth", "solana", "sol", "crypto", "cryptocurrency", "stablecoin", "usdt", "usdc", "tether"]
+market_limit = 200
+# Gamma currently marks all markets as restricted; keep this false unless you want to drop all.
+skip_restricted = false
 request_timeout_secs = 20
 scan_interval_secs = 2
 max_concurrent_orderbook_requests = 8
@@ -32,8 +39,8 @@ user_agent = "polymarket-arb-bot/0.1"
 
 [polymarket.gamma_query]
 closed = "false"
-liquidity_num_min = "50000"
-volume_num_min = "100000"
+liquidity_num_min = "10000"
+volume_num_min = "25000"
 order = "volume24hrClob"
 ascending = "false"
 # tag_id = "<TAG_ID>"
